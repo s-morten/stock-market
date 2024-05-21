@@ -17,8 +17,13 @@ class PriceFetch:
             self._price_to_db(target_price, target_krz, target_id, today)
 
     def _get_price(self, krz):
-        ticker = yf.Ticker(f"{krz}")
-        return ticker.history(period="1d").Close.values[0]
+        try:
+            ticker = yf.Ticker(f"{krz}")
+            price_value = ticker.history(period="1d").Close.values[0]
+            return price_value
+        except:
+            return None
+    
         
     def _price_to_db(self, target_price, target_krz, target_id, today):
         price = Prices()
