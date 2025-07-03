@@ -23,4 +23,4 @@ jobs:
           pip install -r gemini/requirements.txt
 
       - name: Run signal check
-        run: python gemeni/check_signals.py
+        run: python gemini/check_signals.py
