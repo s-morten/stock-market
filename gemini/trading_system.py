@@ -14,6 +14,7 @@ api_secret = os.environ.get('BINANCE_API_SECRET')
 # api_key = "YOUR_API_KEY"
 # api_secret = "YOUR_API_SECRET"
 
+print(api_key, api_secret)
 client = Client(api_key, api_secret)
 
 def get_historical_data(symbol, interval, lookback):

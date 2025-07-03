@@ -2,8 +2,11 @@ import pandas as pd
 from binance.client import Client
 import os
 
+import sys
+sys.path.append("..")
+sys.path.append(".")
 # This script reuses functions from momentum_strategy.py
-from momentum_strategy import load_or_fetch_data, generate_signals
+from gemini.momentum_strategy import load_or_fetch_data, generate_signals
 
 def check_for_buy_signals(tickers, fast_sma, slow_sma):
     """
@@ -45,7 +48,14 @@ def check_for_buy_signals(tickers, fast_sma, slow_sma):
 if __name__ == "__main__":
     # List of tickers to analyze
     tickers_to_process = ["BTCUSDT", "XRPUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "ADAUSDT", 
-                          "SHIBUSDT", "DOTUSDT", "BTTUSDT", "LINKUSDT", "ALGOUSDT", "AVAXUSDT"]
+                            "SHIBUSDT", "DOTUSDT", "BTTUSDT", "LINKUSDT", "ALGOUSDT", "AVAXUSDT",
+                            "XLMUSDT", "NEARUSDT", "LTCUSDT", "CHZUSDT", "POLUSDT", "GRTUSDT",
+                            "LRCUSDT", "ARBUSDT", "UNIUSDT", "GALAUSDT", "INJUSDT", "TRXUSDT", "CRVUSDT",
+                            "ANKRUSDT", "NMRUSDT", "WOOUSDT", "MANAUSDT", "AAVEUSDT", "QNTUSDT", "BCHUSDT",
+                            "SUSHIUSDT", "APEUSDT", "ZRXUSDT", "ETCUSDT", "KSMUSDT", "SANDUSDT", "IMXUSDT", 
+                            "1INCHUSDT", "OPUSDT", "ATOMUSDT", "POWRUSDT", "AXSUSDT", "YFIUSDT", 
+                            "SNXUSDT", "MKRUSDT", "STORJUSDT", "GNOUSDT", "BATUSDT", "REQUSDT", "COMPUSDT", 
+                            "XTZUSDT", "BNTUSDT", "ENJUSDT", "EOSUSDT"]
     
     # Define the periods for the moving averages
     fast_moving_avg = 20

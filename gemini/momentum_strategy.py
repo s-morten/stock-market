@@ -7,14 +7,14 @@ import math
 
 # --- Configuration ---
 # It's recommended to use environment variables for API keys
-api_key = os.environ.get('BINANCE_API_KEY')
-api_secret = os.environ.get('BINANCE_API_SECRET')
+# api_key = os.environ.get('BINANCE_API_KEY')
+# api_secret = os.environ.get('BINANCE_API_SECRET')
 
 # Or, uncomment and hardcode them (not recommended for production)
 # api_key = "YOUR_API_KEY"
 # api_secret = "YOUR_API_SECRET"
 
-client = Client(api_key, api_secret)
+client = Client()
 
 # --- Data Fetching and Caching (Reused from trading_system.py) ---
 
