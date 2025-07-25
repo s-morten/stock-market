@@ -84,10 +84,15 @@ def load_or_fetch_data(tickers, interval, lookback, cache_filename="crypto_data_
     if not all_data_fetch:
         return {}
 
-    combined_for_cache = pd.DataFrame()
+    dfs_to_concat = []
     for ticker, df in all_data_fetch.items():
-        for col in df.columns:
-            combined_for_cache[f"{ticker}_{col}"] = df[col]
+        renamed_df = df.rename(columns={col: f"{ticker}_{col}" for col in df.columns})
+        dfs_to_concat.append(renamed_df)
+
+    if not dfs_to_concat:
+        return {}
+
+    combined_for_cache = pd.concat(dfs_to_concat, axis=1)
             
     combined_for_cache.to_csv(cache_filename)
     print(f"Data fetched and saved to {cache_filename}")
