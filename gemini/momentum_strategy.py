@@ -5,15 +5,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 
-# --- Configuration ---
-# It's recommended to use environment variables for API keys
-# api_key = os.environ.get('BINANCE_API_KEY')
-# api_secret = os.environ.get('BINANCE_API_SECRET')
-
-# Or, uncomment and hardcode them (not recommended for production)
-# api_key = "YOUR_API_KEY"
-# api_secret = "YOUR_API_SECRET"
-
 client = Client()
 
 # --- Data Fetching and Caching (Reused from trading_system.py) ---
@@ -234,20 +225,59 @@ def main(tickers, fast_sma, slow_sma):
     plot_data_with_smas(all_data, buy_signals_df, sell_signals_df, tickers, fast_sma, slow_sma)
 
     # --- 3. Backtesting ---
-    trade_log = run_backtest(all_data, buy_signals_df, sell_signals_df)
+    print("\n--- Running Backtests for Different Time Periods ---")
 
-    print("--- Trade Log Sample ---")
-    print(trade_log.head())
-    print("------------------------")
+    # Get the full date range from the data
+    if not any(not df.empty for df in all_data.values()):
+        print("No data available to process.")
+        return
+        
+    first_date = min(df.index.min() for df in all_data.values() if not df.empty)
+    last_date = max(df.index.max() for df in all_data.values() if not df.empty)
+    start_year = first_date.year
+    end_year = last_date.year
+
+    for s_year in range(start_year, end_year + 1):
+        for e_year in range(s_year + 1, end_year + 1):
+            start_date = pd.to_datetime(f'{s_year}-01-01')
+            end_date = pd.to_datetime(f'{e_year}-12-31')
+
+            # Make sure the dates are within the data range
+            start_date = max(start_date, first_date)
+            end_date = min(end_date, last_date)
+
+            if start_date >= end_date:
+                continue
+
+            print(f"\n--- Running backtest for period: {start_date.date()} to {end_date.date()} ---")
+
+            # Filter data for the period
+            period_data = {}
+            for ticker, df in all_data.items():
+                period_data[ticker] = df[(df.index >= start_date) & (df.index <= end_date)].copy()
+
+            period_buy_signals = buy_signals_df[(buy_signals_df.index >= start_date) & (buy_signals_df.index <= end_date)]
+            period_sell_signals = sell_signals_df[(sell_signals_df.index >= start_date) & (sell_signals_df.index <= end_date)]
+
+            if period_buy_signals.empty and period_sell_signals.empty:
+                print("No signals in this period. Skipping.")
+                continue
+
+            # Run backtest for the period
+            trade_log = run_backtest(period_data, period_buy_signals, period_sell_signals)
+            
+            if not trade_log.empty:
+                print("--- Trade Log Sample ---")
+                print(trade_log.head())
+                print("------------------------")
+            else:
+                print("No trades executed in this period.")
 
 
 if __name__ == "__main__":
-    # Import the backtester
-    from backtester import run_backtest
-    
     # List of tickers to analyze
     tickers_to_process = ["BTCUSDT", "XRPUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "ADAUSDT", 
-                          "SHIBUSDT", "DOTUSDT", "BTTUSDT", "LINKUSDT", "ALGOUSDT", "AVAXUSDT"]
+                          "SHIBUSDT", "DOTUSDT", "LINKUSDT", "ALGOUSDT", "AVAXUSDT"]
     # Define the periods for the moving averages
     fast_moving_avg = 20
     slow_moving_avg = 50

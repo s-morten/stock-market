@@ -56,15 +56,34 @@ def run_backtest(all_data, buy_signals, sell_signals=None, initial_capital=10000
                     exit_date = date + pd.Timedelta(days=1)
 
                     if entry_date in price_data.index and exit_date in price_data.index:
-                        entry_price = price_data.loc[entry_date]['high']
-                        exit_price = price_data.loc[exit_date]['low']
+                        # --- Anomaly Detection Logic ---
+                        max_deviation_factor = 3
                         
+                        # Entry Price
+                        entry_ohlc = price_data.loc[entry_date]
+                        entry_price = entry_ohlc['high']
+                        if entry_ohlc['open'] > 0 and entry_ohlc['close'] > 0:
+                            if entry_price > entry_ohlc['open'] * max_deviation_factor and \
+                               entry_price > entry_ohlc['close'] * max_deviation_factor:
+                                print(f"Warning: Anomaly detected for {ticker} on {entry_date.date()}. High ({entry_price}) is out of ballpark. Using open price ({entry_ohlc['open']}).")
+                                entry_price = entry_ohlc['open']
+
+                        # Exit Price
+                        exit_ohlc = price_data.loc[exit_date]
+                        exit_price = exit_ohlc['low']
+                        if exit_ohlc['open'] > 0 and exit_ohlc['close'] > 0:
+                            if exit_price < exit_ohlc['open'] / max_deviation_factor and \
+                               exit_price < exit_ohlc['close'] / max_deviation_factor:
+                                print(f"Warning: Anomaly detected for {ticker} on {exit_date.date()}. Low ({exit_price}) is out of ballpark. Using open price ({exit_ohlc['open']}).")
+                                exit_price = exit_ohlc['open']
+
                         if entry_price > 0:
-                            trade_return = (exit_price - entry_price) / entry_price
+                            dividends = price_data.loc[entry_date:exit_date]['dividend'].sum()
+                            trade_return = (exit_price - entry_price + dividends) / entry_price
                             trades.append({
                                 'ticker': ticker, 'entry_signal_date': active_buy_date,
                                 'exit_signal_date': date, 'entry_price': entry_price,
-                                'exit_price': exit_price, 'return': trade_return
+                                'exit_price': exit_price, 'dividends': dividends, 'return': trade_return
                             })
                     active_buy_date = None
         else:
@@ -74,15 +93,34 @@ def run_backtest(all_data, buy_signals, sell_signals=None, initial_capital=10000
                 exit_date = buy_date + pd.Timedelta(days=holding_period)
 
                 if entry_date in price_data.index and exit_date in price_data.index:
-                    entry_price = price_data.loc[entry_date]['high']
-                    exit_price = price_data.loc[exit_date]['low']
+                    # --- Anomaly Detection Logic ---
+                    max_deviation_factor = 3
+                    
+                    # Entry Price
+                    entry_ohlc = price_data.loc[entry_date]
+                    entry_price = entry_ohlc['high']
+                    if entry_ohlc['open'] > 0 and entry_ohlc['close'] > 0:
+                        if entry_price > entry_ohlc['open'] * max_deviation_factor and \
+                           entry_price > entry_ohlc['close'] * max_deviation_factor:
+                            print(f"Warning: Anomaly detected for {ticker} on {entry_date.date()}. High ({entry_price}) is out of ballpark. Using open price ({entry_ohlc['open']}).")
+                            entry_price = entry_ohlc['open']
+
+                    # Exit Price
+                    exit_ohlc = price_data.loc[exit_date]
+                    exit_price = exit_ohlc['low']
+                    if exit_ohlc['open'] > 0 and exit_ohlc['close'] > 0:
+                        if exit_price < exit_ohlc['open'] / max_deviation_factor and \
+                           exit_price < exit_ohlc['close'] / max_deviation_factor:
+                            print(f"Warning: Anomaly detected for {ticker} on {exit_date.date()}. Low ({exit_price}) is out of ballpark. Using open price ({exit_ohlc['open']}).")
+                            exit_price = exit_ohlc['open']
                     
                     if entry_price > 0:
-                        trade_return = (exit_price - entry_price) / entry_price
+                        dividends = price_data.loc[entry_date:exit_date]['dividend'].sum()
+                        trade_return = (exit_price - entry_price + dividends) / entry_price
                         trades.append({
                             'ticker': ticker, 'entry_signal_date': buy_date,
                             'exit_signal_date': exit_date, 'entry_price': entry_price,
-                            'exit_price': exit_price, 'return': trade_return
+                            'exit_price': exit_price, 'dividends': dividends, 'return': trade_return
                         })
 
     if not trades:
