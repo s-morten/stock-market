@@ -56,7 +56,7 @@ def load_companies(session_factory) -> pd.DataFrame:
         session_factory: SQLAlchemy sessionmaker.
 
     Returns:
-        pd.DataFrame: Columns cik, name, sic, fiscal_year_end.
+        pd.DataFrame: Columns cik, name, sic, fiscal_year_end, ticker.
     """
     with session_factory() as session:
         repo = CompanyRepository(session)
@@ -68,6 +68,7 @@ def load_companies(session_factory) -> pd.DataFrame:
                 "name": c.name,
                 "sic": c.sic,
                 "fiscal_year_end": c.fiscal_year_end,
+                "ticker": c.ticker,
             }
             for c in companies
         ]
