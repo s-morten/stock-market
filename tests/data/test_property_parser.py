@@ -251,3 +251,79 @@ class TestPropertyResultToRows:
         result = extract_property_data(_NO_ITEM2_HTML, "acc-002", "10-K")
         rows = property_result_to_rows(result, "0001045609", "PLD", "2022-12-31")
         assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for iXBRL detection and parser selection
+# ---------------------------------------------------------------------------
+
+_IXBRL_HTML = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:ix="https://xbrl.org/2013/inlineXBRL">
+<body>
+<p>ITEM 2. Properties</p>
+<div>
+  <table>
+    <tr><th></th><th>Number of Properties</th></tr>
+    <tr><td>Industrial</td><td>500</td></tr>
+    <tr><td>Office</td><td>120</td></tr>
+  </table>
+</div>
+</body>
+</html>
+"""
+
+_PLAIN_HTML = """\
+<html>
+<body>
+<h2>Item 2. Properties</h2>
+<table>
+  <tr><th></th><th>Number of Properties</th></tr>
+  <tr><td>Industrial</td><td>300</td></tr>
+</table>
+</body>
+</html>
+"""
+
+
+class TestIXBRLDetection:
+    """Tests for _detect_parser and iXBRL-aware extract_property_data."""
+
+    def test_detects_xml_declaration(self):
+        """<?xml version …> prefix triggers lxml-xml parser."""
+        from reit_dashboard.data.property_parser import _detect_parser
+
+        assert _detect_parser('<?xml version="1.0"?><html>') == "lxml-xml"
+
+    def test_detects_ix_namespace(self):
+        """xmlns:ix= attribute triggers lxml-xml parser."""
+        from reit_dashboard.data.property_parser import _detect_parser
+
+        assert _detect_parser('<html xmlns:ix="https://xbrl.org/2013">') == "lxml-xml"
+
+    def test_plain_html_uses_lxml(self):
+        """Plain HTML without XML markers uses the lxml HTML parser."""
+        from reit_dashboard.data.property_parser import _detect_parser
+
+        assert _detect_parser("<html><body><h1>Hello</h1></body></html>") == "lxml"
+
+    def test_ixbrl_item2_found_via_p_tag(self):
+        """iXBRL document where Item 2 is in a <p> tag is parsed correctly."""
+        result = extract_property_data(_IXBRL_HTML, "acc-ixbrl-001", "10-K")
+        assert len(result.records) == 2
+        types = [r.property_type for r in result.records]
+        assert "Industrial" in types
+        assert "Office" in types
+
+    def test_ixbrl_num_properties_extracted(self):
+        """num_properties metric is extracted from an iXBRL table."""
+        result = extract_property_data(_IXBRL_HTML, "acc-ixbrl-001", "10-K")
+        industrial = next(r for r in result.records if r.property_type == "Industrial")
+        assert industrial.metrics.get("num_properties") == "500"
+
+    def test_plain_html_still_works(self):
+        """Ensure the non-iXBRL code path is not broken."""
+        result = extract_property_data(_PLAIN_HTML, "acc-plain-001", "10-K")
+        assert len(result.records) == 1
+        assert result.records[0].property_type == "Industrial"

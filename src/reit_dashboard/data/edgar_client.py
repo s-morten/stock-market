@@ -19,8 +19,15 @@ from pydantic import BaseModel, Field
 # Base URL for the EDGAR data API (not the search/EFTS endpoint).
 _EDGAR_BASE = "https://data.sec.gov"
 
-# GAAP concepts fetched for every company in the PoC.
+# GAAP concepts fetched for every company in the PoC (all denominated in USD).
 POC_CONCEPTS = ["Revenues", "NetIncomeLoss", "Assets", "Liabilities"]
+
+# Non-monetary property-portfolio concepts; unit is auto-detected from the
+# response because different companies use different unit labels.
+POC_PROPERTY_CONCEPTS = [
+    "NumberOfRealEstateProperties",  # unit: "Property", "properties", "item", …
+    "AreaOfRealEstateProperty",      # unit: "sqft"
+]
 
 # Minimum seconds between outgoing HTTP requests.
 # The SEC enforces a limit of 10 requests/second; 0.11 s gives a safe margin.
@@ -148,7 +155,7 @@ class EdgarClient:
         cik: str,
         concept: str,
         taxonomy: str = "us-gaap",
-        unit: str = "USD",
+        unit: str | None = "USD",
         since_date: date | None = None,
         forms: set[str] | None = None,
     ) -> ConceptFacts:
@@ -165,6 +172,10 @@ class EdgarClient:
             concept:    GAAP XBRL tag (e.g. "Revenues").
             taxonomy:   XBRL taxonomy namespace (default "us-gaap").
             unit:       Unit of measure to extract (default "USD").
+                        Pass ``None`` to auto-select the first available
+                        unit – useful for non-monetary concepts such as
+                        ``NumberOfRealEstateProperties`` where the unit
+                        label varies by company.
             since_date: Exclude entries whose period end is before this
                         date.  Pass ``None`` to include all history.
             forms:      Set of filing form types to keep.  Defaults to
@@ -186,9 +197,15 @@ class EdgarClient:
         )
         data = self._get(url)
 
-        raw_entries: list[dict[str, Any]] = (
-            data.get("units", {}).get(unit, [])
-        )
+        units_map: dict[str, list[dict[str, Any]]] = data.get("units", {})
+
+        if unit is None:
+            # Auto-detect: pick the unit with the most facts entries.
+            if not units_map:
+                raise KeyError(f"No units found for concept {concept}")
+            unit = max(units_map, key=lambda k: len(units_map[k]))
+
+        raw_entries: list[dict[str, Any]] = units_map.get(unit, [])
 
         # Keep only requested form types; require a period end date.
         filtered = [
@@ -210,6 +227,7 @@ class EdgarClient:
 
         entries = [FactEntry(**e) for e in seen.values()]
         return ConceptFacts(concept=concept, unit=unit, entries=entries)
+
 
     def fetch_all_poc_facts(
         self,
@@ -246,6 +264,20 @@ class EdgarClient:
                 )
             except (httpx.HTTPStatusError, KeyError):
                 # Concept not available for this company – skip gracefully.
+                pass
+        # Property-portfolio concepts use non-monetary units; auto-detect.
+        for concept in POC_PROPERTY_CONCEPTS:
+            try:
+                results.append(
+                    self.fetch_concept_facts(
+                        cik,
+                        concept,
+                        unit=None,  # auto-detect unit label
+                        since_date=since_date,
+                        forms=forms,
+                    )
+                )
+            except (httpx.HTTPStatusError, KeyError):
                 pass
         return results
 

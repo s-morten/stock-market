@@ -700,19 +700,84 @@ def main() -> None:
             )
 
     # ================================================================== #
-    # Section 3 – Property Portfolio (Item 2 HTML parser)                 #
+    # Section 3 – Property Portfolio                                      #
     # ================================================================== #
     st.header("🏗️ Property Portfolio")
     st.caption(
-        "Data parsed from Item 2 of SEC 10-K/10-Q filings. "
+        "XBRL structured counts are fetched directly from EDGAR. "
+        "Property-type breakdown is parsed from Item 2 of SEC 10-K/10-Q filings. "
         "Run `uv run python scripts/ingest_poc.py` to populate."
     )
 
+    # ------------------------------------------------------------------
+    # 3a – XBRL property count and area (structured, directly from API)
+    # ------------------------------------------------------------------
+    xbrl_prop_tab, xbrl_area_tab = st.tabs(
+        ["📦 Property Count (XBRL)", "📐 Property Area sqft (XBRL)"]
+    )
+
+    for tab_widget, concept_name, y_title, y_fmt in [
+        (xbrl_prop_tab, "NumberOfRealEstateProperties", "Number of Properties", "~s"),
+        (xbrl_area_tab, "AreaOfRealEstateProperty", "Area (sq ft)", "~s"),
+    ]:
+        with tab_widget:
+            xbrl_df = load_facts(
+                session_factory,
+                selected_ciks,
+                concept=concept_name,
+                form="10-K",
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if xbrl_df.empty:
+                # Try 10-Q if no 10-K data
+                xbrl_df = load_facts(
+                    session_factory,
+                    selected_ciks,
+                    concept=concept_name,
+                    form="10-Q",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            if xbrl_df.empty:
+                st.info(
+                    f"No XBRL data for `{concept_name}`. "
+                    "Re-run ingestion to populate."
+                )
+            else:
+                chart = (
+                    alt.Chart(xbrl_df)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("period_end:T", title="Period End",
+                                axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                        y=alt.Y("value:Q", title=y_title,
+                                axis=alt.Axis(format=y_fmt)),
+                        color=alt.Color("company_name:N", title="Company"),
+                        tooltip=[
+                            alt.Tooltip("company_name:N", title="Company"),
+                            alt.Tooltip("period_end:T", title="Period",
+                                        format="%Y-%m-%d"),
+                            alt.Tooltip("value:Q", title=y_title,
+                                        format=",.0f"),
+                        ],
+                    )
+                    .properties(title=y_title, height=360)
+                    .interactive()
+                )
+                st.altair_chart(chart, use_container_width=True)
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # 3b – Item 2 HTML-parsed property-type breakdown
+    # ------------------------------------------------------------------
+    st.subheader("📋 Property-Type Breakdown (Item 2 HTML parser)")
     prop_df_all = load_property_facts(session_factory, selected_ciks)
 
     if prop_df_all.empty:
         st.info(
-            "No property data found. Re-run ingestion with Phase 3 "
+            "No property-type data found. Re-run ingestion with Phase 3 "
             "(HTML parser) to populate this section."
         )
     else:

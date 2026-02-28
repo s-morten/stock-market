@@ -10,16 +10,20 @@ Workflow
    ``{property_type: {metric_name: value, ...}, ...}``
 
 The parser is intentionally tolerant of formatting variations between
-companies and across filing years.
+companies and across filing years.  Modern filings use iXBRL (Inline XBRL),
+which is an XML document.  The parser detects iXBRL automatically and
+selects the appropriate BeautifulSoup parser (``lxml-xml`` for iXBRL,
+``lxml`` for plain HTML).
 """
 
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
 
 # Regex that matches the "Item 2" heading in various formats:
 #   "Item 2. Properties"
@@ -33,6 +37,35 @@ _ITEM2_PATTERN = re.compile(
 
 # Headings we scan for the Item 2 marker.
 _HEADING_TAGS = ("h1", "h2", "h3", "h4")
+
+# Fallback inline/block tags used when no heading-level tag is found
+# (common in iXBRL filings and older plain-HTML 10-K documents).
+_FALLBACK_TAGS = ("b", "strong", "p", "span", "div")
+
+# iXBRL indicator: modern Inline XBRL documents declare the ix: namespace.
+_IXBRL_PATTERN = re.compile(
+    r'xmlns:ix\s*=|<\?xml\s+version',
+    re.IGNORECASE,
+)
+
+
+def _detect_parser(html: str) -> str:
+    """
+    Choose the appropriate BeautifulSoup parser for the filing HTML.
+
+    Modern SEC filings are Inline XBRL (iXBRL) documents.  These are
+    XML at the wire level and must be parsed with ``lxml-xml`` to
+    correctly resolve the element tree.  Plain HTML filings (older
+    documents) use the ``lxml`` HTML parser.
+
+    Parameters:
+        html: Raw text content of the filing document.
+
+    Returns:
+        ``"lxml-xml"`` for iXBRL/XML documents, ``"lxml"`` otherwise.
+    """
+    # Only scan the first 2 kB – the declaration is always near the top.
+    return "lxml-xml" if _IXBRL_PATTERN.search(html[:2048]) else "lxml"
 
 # Common metric column names and their normalised keys.
 _METRIC_ALIASES: dict[str, str] = {
@@ -127,6 +160,13 @@ def find_item2_section(soup: BeautifulSoup) -> Tag | None:
     Locate the heading element that marks the start of Item 2.
 
     Searches all h1–h4 tags for text matching :data:`_ITEM2_PATTERN`.
+    Falls back to :data:`_FALLBACK_TAGS` (bold, paragraph, span, div)
+    which cover older plain-HTML filings and modern iXBRL documents
+    where Item 2 is rendered in a styled ``<p>`` or ``<span>``.
+
+    The match is restricted to short text snippets (≤ 200 chars) so we
+    don't accidentally match long paragraphs that merely mention
+    "Item 2".
 
     Parameters:
         soup: Parsed BeautifulSoup document.
@@ -136,13 +176,13 @@ def find_item2_section(soup: BeautifulSoup) -> Tag | None:
     """
     for tag in soup.find_all(_HEADING_TAGS):
         text = _clean_text(tag.get_text())
-        if _ITEM2_PATTERN.search(text):
+        if _ITEM2_PATTERN.search(text) and len(text) <= 200:
             return tag
-    # Fallback: look for bold/strong elements with matching text that act
-    # as de-facto headings in older filings.
-    for tag in soup.find_all(["b", "strong", "p"]):
+    # Fallback: bold/strong/paragraph/span/div acting as headings in
+    # older plain-HTML filings and iXBRL-based modern filings.
+    for tag in soup.find_all(_FALLBACK_TAGS):
         text = _clean_text(tag.get_text())
-        if _ITEM2_PATTERN.search(text):
+        if _ITEM2_PATTERN.search(text) and len(text) <= 200:
             return tag
     return None
 
@@ -259,6 +299,10 @@ def extract_property_data(
     """
     Full pipeline: parse HTML → find Item 2 heading → parse first table.
 
+    Automatically detects whether the document is an Inline XBRL (iXBRL)
+    file and selects the appropriate parser (``lxml-xml`` for iXBRL,
+    ``lxml`` for plain HTML).
+
     Parameters:
         html:  Raw HTML text of the SEC filing document.
         accn:  Accession number for attribution.
@@ -268,7 +312,12 @@ def extract_property_data(
         :class:`PropertyTableResult`.  ``records`` is empty when parsing
         failed (e.g. Item 2 or a following table was not found).
     """
-    soup = BeautifulSoup(html, "lxml")
+    parser = _detect_parser(html)
+    # Suppress BeautifulSoup's warning when we intentionally parse XML with
+    # the HTML-mode lxml parser (only happens for the "lxml" fallback path).
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(html, parser)
 
     item2_tag = find_item2_section(soup)
     if item2_tag is None:

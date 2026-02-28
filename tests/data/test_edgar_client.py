@@ -180,6 +180,8 @@ class TestFetchConceptFacts:
     @respx.mock
     def test_fetch_all_poc_facts_skips_missing(self):
         """A 404 on a concept should be silently skipped."""
+        from reit_dashboard.data.edgar_client import POC_PROPERTY_CONCEPTS
+
         # Only Revenues returns 200; all others return 404.
         base = (
             "https://data.sec.gov/api/xbrl/companyconcept/"
@@ -189,6 +191,11 @@ class TestFetchConceptFacts:
             return_value=httpx.Response(200, json=CONCEPT_PAYLOAD)
         )
         for concept in POC_CONCEPTS[1:]:
+            respx.get(base + f"{concept}.json").mock(
+                return_value=httpx.Response(404)
+            )
+        # Property concepts also need to be mocked (all returning 404).
+        for concept in POC_PROPERTY_CONCEPTS:
             respx.get(base + f"{concept}.json").mock(
                 return_value=httpx.Response(404)
             )
@@ -271,3 +278,120 @@ class TestFormsFilter:
 
         assert len(sleep_calls) == 1
         assert sleep_calls[0] > 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for non-monetary property concepts (unit=None auto-detect)
+# ---------------------------------------------------------------------------
+
+PROPERTY_COUNT_PAYLOAD = {
+    "units": {
+        "Property": [
+            {
+                "end": "2023-12-31",
+                "val": 2500,
+                "form": "10-K",
+                "accn": "0001045609-24-000001",
+            },
+            {
+                "end": "2022-12-31",
+                "val": 2300,
+                "form": "10-K",
+                "accn": "0001045609-23-000001",
+            },
+        ]
+    }
+}
+
+MIXED_UNITS_PAYLOAD = {
+    "units": {
+        "Property": [
+            {"end": "2023-12-31", "val": 10, "form": "10-K", "accn": "A1"},
+        ],
+        "properties": [
+            {"end": "2023-12-31", "val": 100, "form": "10-K", "accn": "A2"},
+            {"end": "2022-12-31", "val": 90, "form": "10-K", "accn": "A3"},
+        ],
+    }
+}
+
+
+class TestPropertyConcepts:
+    """Tests for unit=None auto-detection in fetch_concept_facts."""
+
+    @respx.mock
+    def test_auto_detect_unit_picks_largest(self):
+        """unit=None should pick the unit with the most entries."""
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/NumberOfRealEstateProperties.json"
+        ).mock(return_value=httpx.Response(200, json=MIXED_UNITS_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        result = client.fetch_concept_facts(
+            "0001045609", "NumberOfRealEstateProperties", unit=None
+        )
+
+        # "properties" has 2 entries vs "Property" with 1 → auto-picks "properties"
+        assert result.unit == "properties"
+        assert len(result.entries) == 2
+
+    @respx.mock
+    def test_fetch_concept_facts_with_property_unit(self):
+        """Property unit facts are returned correctly."""
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/NumberOfRealEstateProperties.json"
+        ).mock(return_value=httpx.Response(200, json=PROPERTY_COUNT_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        result = client.fetch_concept_facts(
+            "0001045609", "NumberOfRealEstateProperties", unit=None
+        )
+
+        assert result.concept == "NumberOfRealEstateProperties"
+        assert result.unit == "Property"
+        assert len(result.entries) == 2
+        assert result.entries[0].val in {2500, 2300}
+
+    @respx.mock
+    def test_fetch_all_poc_facts_includes_property_concepts(self):
+        """fetch_all_poc_facts should attempt POC_PROPERTY_CONCEPTS too."""
+        from reit_dashboard.data.edgar_client import POC_PROPERTY_CONCEPTS
+
+        base = (
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/"
+        )
+        # All monetary concepts return 404.
+        for concept in POC_CONCEPTS:
+            respx.get(base + f"{concept}.json").mock(
+                return_value=httpx.Response(404)
+            )
+        # Property count returns data; area returns 404.
+        respx.get(base + "NumberOfRealEstateProperties.json").mock(
+            return_value=httpx.Response(200, json=PROPERTY_COUNT_PAYLOAD)
+        )
+        respx.get(base + "AreaOfRealEstateProperty.json").mock(
+            return_value=httpx.Response(404)
+        )
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        results = client.fetch_all_poc_facts("0001045609")
+
+        assert len(results) == 1
+        assert results[0].concept == "NumberOfRealEstateProperties"
+
+    @respx.mock
+    def test_no_units_in_response_raises_key_error(self):
+        """Empty units dict with unit=None should raise KeyError."""
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/NumberOfRealEstateProperties.json"
+        ).mock(return_value=httpx.Response(200, json={"units": {}}))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        with pytest.raises(KeyError):
+            client.fetch_concept_facts(
+                "0001045609", "NumberOfRealEstateProperties", unit=None
+            )
