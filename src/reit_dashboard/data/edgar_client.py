@@ -10,6 +10,7 @@ All network calls use httpx for easy async upgrade and test mocking.
 """
 
 import time
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
@@ -19,12 +20,105 @@ from pydantic import BaseModel, Field
 # Base URL for the EDGAR data API (not the search/EFTS endpoint).
 _EDGAR_BASE = "https://data.sec.gov"
 
-# GAAP concepts fetched for every company in the PoC.
-POC_CONCEPTS = ["Revenues", "NetIncomeLoss", "Assets", "Liabilities"]
-
 # Minimum seconds between outgoing HTTP requests.
 # The SEC enforces a limit of 10 requests/second; 0.11 s gives a safe margin.
 _REQUEST_DELAY_SECONDS = 0.11
+
+
+@dataclass(frozen=True)
+class ConceptConfig:
+    """
+    Configuration for a single XBRL concept to fetch.
+
+    Attributes:
+        concept:   XBRL tag name (e.g. "Revenues").
+        unit:      Expected unit string (e.g. "USD", "USD/shares", "sqft").
+                   When None the client auto-detects the first available unit.
+        forms:     Set of SEC filing form types to accept.  Defaults to
+                   both annual and quarterly filings.
+        taxonomy:  XBRL taxonomy namespace.  Almost always "us-gaap".
+    """
+
+    concept: str
+    unit: str | None = None
+    forms: frozenset[str] = field(
+        default_factory=lambda: frozenset({"10-K", "10-Q"})
+    )
+    taxonomy: str = "us-gaap"
+
+
+# ---------------------------------------------------------------------------
+# Concept catalogue
+# ---------------------------------------------------------------------------
+
+# Core quarterly financial concepts (existing).
+CORE_CONCEPTS: list[ConceptConfig] = [
+    ConceptConfig("Revenues", "USD"),
+    ConceptConfig("NetIncomeLoss", "USD"),
+    ConceptConfig("Assets", "USD"),
+    ConceptConfig("Liabilities", "USD"),
+]
+
+# Extended concepts added for richer REIT analysis.
+EXTENDED_CONCEPTS: list[ConceptConfig] = [
+    # --- FFO components ---
+    ConceptConfig("DepreciationAndAmortization", "USD"),
+    # Two alternative tags for property sale gains; both are tried.
+    ConceptConfig("GainLossOnSaleOfProperties", "USD"),
+    ConceptConfig("GainsLossesOnSalesOfInvestmentRealEstate", "USD"),
+    # --- Additional income statement / cash flow ---
+    ConceptConfig("OperatingIncomeLoss", "USD"),
+    ConceptConfig("InterestExpense", "USD"),
+    ConceptConfig("NetCashProvidedByUsedInOperatingActivities", "USD"),
+    # --- Portfolio / balance sheet ---
+    ConceptConfig("RealEstateInvestmentPropertyNet", "USD"),
+    # NumberOfRealEstateProperties uses a non-standard unit; auto-detect.
+    ConceptConfig("NumberOfRealEstateProperties", None),
+    # AreaOfRealEstateProperty is reported in sqft or sqmt; auto-detect.
+    ConceptConfig("AreaOfRealEstateProperty", None),
+    # --- Dividends ---
+    # Reported per-share; unit is "USD/shares".
+    ConceptConfig("CommonStockDividendsPerShareDeclared", "USD/shares"),
+    # --- Debt ---
+    ConceptConfig("LongTermDebt", "USD"),
+    # Debt maturity schedule by year – annual filings only.
+    ConceptConfig(
+        "LongTermDebtMaturitiesRepaymentsOfPrincipalInNextTwelveMonths",
+        "USD",
+        frozenset({"10-K"}),
+    ),
+    ConceptConfig(
+        "LongTermDebtMaturitiesRepaymentsOfPrincipalInYearTwo",
+        "USD",
+        frozenset({"10-K"}),
+    ),
+    ConceptConfig(
+        "LongTermDebtMaturitiesRepaymentsOfPrincipalInYearThree",
+        "USD",
+        frozenset({"10-K"}),
+    ),
+    ConceptConfig(
+        "LongTermDebtMaturitiesRepaymentsOfPrincipalInYearFour",
+        "USD",
+        frozenset({"10-K"}),
+    ),
+    ConceptConfig(
+        "LongTermDebtMaturitiesRepaymentsOfPrincipalInYearFive",
+        "USD",
+        frozenset({"10-K"}),
+    ),
+    ConceptConfig(
+        "LongTermDebtMaturitiesRepaymentsOfPrincipalAfterYearFive",
+        "USD",
+        frozenset({"10-K"}),
+    ),
+]
+
+# Convenience: all concepts in one list.
+ALL_CONCEPTS: list[ConceptConfig] = CORE_CONCEPTS + EXTENDED_CONCEPTS
+
+# Legacy list kept for backwards-compatibility with existing tests.
+POC_CONCEPTS: list[str] = [c.concept for c in CORE_CONCEPTS]
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +242,7 @@ class EdgarClient:
         cik: str,
         concept: str,
         taxonomy: str = "us-gaap",
-        unit: str = "USD",
+        unit: str | None = "USD",
         since_date: date | None = None,
         forms: set[str] | None = None,
     ) -> ConceptFacts:
@@ -160,11 +254,17 @@ class EdgarClient:
         the entry with the most recent period end date.  Entries with a
         ``period_end`` before ``since_date`` are discarded.
 
+        When ``unit`` is ``None`` the method auto-detects the first unit
+        with data (useful for concepts like NumberOfRealEstateProperties
+        that use non-standard unit strings).
+
         Parameters:
             cik:        Company CIK.
             concept:    GAAP XBRL tag (e.g. "Revenues").
             taxonomy:   XBRL taxonomy namespace (default "us-gaap").
             unit:       Unit of measure to extract (default "USD").
+                        Pass ``None`` to auto-detect the first available
+                        unit.
             since_date: Exclude entries whose period end is before this
                         date.  Pass ``None`` to include all history.
             forms:      Set of filing form types to keep.  Defaults to
@@ -174,7 +274,7 @@ class EdgarClient:
             ConceptFacts: Parsed fact entries for the concept.
 
         Raises:
-            KeyError: If the concept or unit is not present in the data.
+            KeyError: If the concept or no units are present in the data.
         """
         if forms is None:
             forms = {"10-K", "10-Q"}
@@ -186,9 +286,18 @@ class EdgarClient:
         )
         data = self._get(url)
 
-        raw_entries: list[dict[str, Any]] = (
-            data.get("units", {}).get(unit, [])
-        )
+        units_data: dict[str, Any] = data.get("units", {})
+        if not units_data:
+            raise KeyError(f"No units found for concept {concept!r}")
+
+        # Auto-detect unit if not specified.
+        resolved_unit: str
+        if unit is None:
+            resolved_unit = next(iter(units_data))
+        else:
+            resolved_unit = unit
+
+        raw_entries: list[dict[str, Any]] = units_data.get(resolved_unit, [])
 
         # Keep only requested form types; require a period end date.
         filtered = [
@@ -209,7 +318,7 @@ class EdgarClient:
                 seen[accn] = entry
 
         entries = [FactEntry(**e) for e in seen.values()]
-        return ConceptFacts(concept=concept, unit=unit, entries=entries)
+        return ConceptFacts(concept=concept, unit=resolved_unit, entries=entries)
 
     def fetch_all_poc_facts(
         self,
@@ -218,32 +327,67 @@ class EdgarClient:
         forms: set[str] | None = None,
     ) -> list[ConceptFacts]:
         """
-        Fetch all PoC XBRL concepts for a company.
+        Fetch the four core XBRL concepts for a company (legacy helper).
 
-        Silently skips any concept that is not reported by the company
-        (e.g. some REITs use non-standard tags for revenue).
+        Silently skips any concept that is not reported by the company.
 
         Parameters:
             cik:        Company CIK.
-            since_date: Earliest period end date to include (passed
-                        through to :meth:`fetch_concept_facts`).
-            forms:      Filing form types to include (passed through to
-                        :meth:`fetch_concept_facts`).
+            since_date: Earliest period end date to include.
+            forms:      Filing form types to include.
+
+        Returns:
+            list[ConceptFacts]: One entry per successfully fetched concept.
+        """
+        return self.fetch_concepts(
+            cik,
+            CORE_CONCEPTS,
+            since_date=since_date,
+            forms_override=forms,
+        )
+
+    def fetch_concepts(
+        self,
+        cik: str,
+        configs: list[ConceptConfig],
+        since_date: date | None = None,
+        forms_override: set[str] | None = None,
+    ) -> list[ConceptFacts]:
+        """
+        Fetch an arbitrary list of XBRL concepts for a company.
+
+        Each concept in ``configs`` carries its own unit hint and forms
+        filter.  ``forms_override`` replaces the per-concept forms setting
+        when provided (useful for bulk overrides such as "10-Q only").
+
+        Silently skips concepts that return a 404 or have no matching data.
+
+        Parameters:
+            cik:            Company CIK.
+            configs:        List of ConceptConfig descriptors.
+            since_date:     Earliest period end date to include.
+            forms_override: When set, overrides the forms in every config.
 
         Returns:
             list[ConceptFacts]: One entry per successfully fetched concept.
         """
         results: list[ConceptFacts] = []
-        for concept in POC_CONCEPTS:
+        for cfg in configs:
+            effective_forms = (
+                set(forms_override) if forms_override is not None
+                else set(cfg.forms)
+            )
             try:
-                results.append(
-                    self.fetch_concept_facts(
-                        cik,
-                        concept,
-                        since_date=since_date,
-                        forms=forms,
-                    )
+                cf = self.fetch_concept_facts(
+                    cik,
+                    cfg.concept,
+                    taxonomy=cfg.taxonomy,
+                    unit=cfg.unit,
+                    since_date=since_date,
+                    forms=effective_forms,
                 )
+                if cf.entries:
+                    results.append(cf)
             except (httpx.HTTPStatusError, KeyError):
                 # Concept not available for this company – skip gracefully.
                 pass

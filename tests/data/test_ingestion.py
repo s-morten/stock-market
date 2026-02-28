@@ -44,7 +44,7 @@ def _make_client_mock(
     client.fetch_company_info.return_value = CompanyInfo(
         cik=cik, name=name, sic="6798", fiscalYearEnd="12-31"
     )
-    client.fetch_all_poc_facts.return_value = [
+    client.fetch_concepts.return_value = [
         ConceptFacts(
             concept=c,
             unit="USD",
@@ -96,13 +96,13 @@ class TestIngestCompany:
         client.fetch_company_info.assert_called_once_with("0001045609")
 
     def test_since_date_passed_to_client(self, db_session):
-        """ingest_company forwards since_date to fetch_all_poc_facts."""
+        """ingest_company forwards since_date to fetch_concepts."""
         from datetime import date
 
         client = _make_client_mock()
         cutoff = date(2020, 1, 1)
         ingest_company("0001045609", client, db_session, since_date=cutoff)
-        _, kwargs = client.fetch_all_poc_facts.call_args
+        _, kwargs = client.fetch_concepts.call_args
         assert kwargs.get("since_date") == cutoff
 
 
@@ -116,7 +116,7 @@ class TestIngestAllPocReits:
         client.fetch_company_info.side_effect = lambda cik: CompanyInfo(
             cik=cik, name=f"Company {cik}", sic="6798", fiscalYearEnd="12-31"
         )
-        client.fetch_all_poc_facts.return_value = []
+        client.fetch_concepts.return_value = []
 
         results = ingest_all_poc_reits(client, db_session)
 
@@ -138,7 +138,7 @@ class TestIngestAllPocReits:
 
         client = MagicMock()
         client.fetch_company_info.side_effect = side_effect
-        client.fetch_all_poc_facts.return_value = []
+        client.fetch_concepts.return_value = []
 
         results = ingest_all_poc_reits(client, db_session)
 

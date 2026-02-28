@@ -236,7 +236,114 @@ class TestSinceDateFilter:
         assert len(result.entries) == 3
 
 
-class TestFormsFilter:
+    @respx.mock
+    def test_unit_none_auto_detects(self):
+        """When unit=None the client uses the first available unit key."""
+        payload = {
+            "units": {
+                "properties": [
+                    {
+                        "end": "2022-12-31",
+                        "val": 5500,
+                        "form": "10-K",
+                        "accn": "0001045609-23-000001",
+                    }
+                ]
+            }
+        }
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/NumberOfRealEstateProperties.json"
+        ).mock(return_value=httpx.Response(200, json=payload))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        result = client.fetch_concept_facts(
+            "0001045609", "NumberOfRealEstateProperties", unit=None
+        )
+
+        assert result.unit == "properties"
+        assert len(result.entries) == 1
+        assert result.entries[0].val == 5500
+
+    @respx.mock
+    def test_unit_key_missing_raises(self):
+        """KeyError is raised when the payload has no units at all."""
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/Revenues.json"
+        ).mock(return_value=httpx.Response(200, json={"units": {}}))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        with pytest.raises(KeyError):
+            client.fetch_concept_facts("0001045609", "Revenues", unit=None)
+
+
+class TestFetchConcepts:
+    """Tests for EdgarClient.fetch_concepts (multi-concept batch method)."""
+
+    @respx.mock
+    def test_returns_all_successful_concepts(self):
+        """fetch_concepts returns one entry per concept with data."""
+        from reit_dashboard.data.edgar_client import CORE_CONCEPTS, ConceptConfig
+
+        base = (
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/"
+        )
+        for cfg in CORE_CONCEPTS:
+            respx.get(base + f"{cfg.concept}.json").mock(
+                return_value=httpx.Response(200, json=CONCEPT_PAYLOAD)
+            )
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        results = client.fetch_concepts("0001045609", CORE_CONCEPTS)
+
+        assert len(results) == len(CORE_CONCEPTS)
+
+    @respx.mock
+    def test_skips_404_concepts(self):
+        """A 404 for one concept is silently skipped."""
+        from reit_dashboard.data.edgar_client import ConceptConfig
+
+        configs = [
+            ConceptConfig("Revenues", "USD"),
+            ConceptConfig("SomeObscureConcept", "USD"),
+        ]
+        base = (
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/"
+        )
+        respx.get(base + "Revenues.json").mock(
+            return_value=httpx.Response(200, json=CONCEPT_PAYLOAD)
+        )
+        respx.get(base + "SomeObscureConcept.json").mock(
+            return_value=httpx.Response(404)
+        )
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        results = client.fetch_concepts("0001045609", configs)
+
+        assert len(results) == 1
+        assert results[0].concept == "Revenues"
+
+    @respx.mock
+    def test_forms_override_takes_precedence(self):
+        """forms_override replaces per-concept forms settings."""
+        from reit_dashboard.data.edgar_client import ConceptConfig
+
+        configs = [ConceptConfig("Revenues", "USD", frozenset({"10-K"}))]
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/Revenues.json"
+        ).mock(return_value=httpx.Response(200, json=CONCEPT_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        # Override to 10-Q only – should exclude 10-K entries.
+        results = client.fetch_concepts(
+            "0001045609", configs, forms_override={"10-Q"}
+        )
+
+        assert all(e.form == "10-Q" for e in results[0].entries)
     """Tests for the forms parameter in fetch_concept_facts."""
 
     @respx.mock
