@@ -18,11 +18,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from reit_dashboard.data.edgar_client import (
-    ALL_CONCEPTS,
-    CORE_CONCEPTS,
-    EdgarClient,
-)
+from reit_dashboard.data.edgar_client import EdgarClient
 from reit_dashboard.data.models import Company, FinancialFact, StockPrice
 from reit_dashboard.data.repository import (
     CompanyRepository,
@@ -100,12 +96,9 @@ def ingest_company(
     )
     company_repo.upsert(company)
 
-    # --- 2. Financial facts (all concepts, last 5 years) ---
-    # Core concepts use the forms_override (default 10-Q only).
-    # Extended concepts honour their own per-concept forms setting so that
-    # e.g. debt maturity concepts (10-K only) are fetched correctly.
-    all_concept_facts = client.fetch_concepts(
-        cik, ALL_CONCEPTS, since_date=since_date
+    # --- 2. Financial facts (10-Q, last 5 years) ---
+    all_concept_facts = client.fetch_all_poc_facts(
+        cik, since_date=since_date, forms=_INGEST_FORMS
     )
     facts_upserted = 0
 
