@@ -648,9 +648,9 @@ def compute_ffo(facts: dict[str, pd.DataFrame]) -> pd.DataFrame:
     ni = facts.get("NetIncomeLoss")
     da = facts.get("DepreciationAndAmortization")
     # Accept either gain-on-sale tag.
-    gains = facts.get("GainLossOnSaleOfProperties") or facts.get(
-        "GainsLossesOnSalesOfInvestmentRealEstate"
-    )
+    gains = facts.get("GainLossOnSaleOfProperties")
+    if gains is None:
+        gains = facts.get("GainsLossesOnSalesOfInvestmentRealEstate")
 
     if ni is None or da is None:
         return pd.DataFrame()
