@@ -27,3 +27,7 @@ htmlcov/
 # IDE
 .vscode/
 .idea/
+
+# Property extraction output files
+property_extract.json
+property_extract.txt
