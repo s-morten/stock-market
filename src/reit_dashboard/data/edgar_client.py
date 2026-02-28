@@ -9,6 +9,7 @@ The SEC requires a descriptive User-Agent header on every request.
 All network calls use httpx for easy async upgrade and test mocking.
 """
 
+import time
 from datetime import date
 from typing import Any
 
@@ -20,6 +21,10 @@ _EDGAR_BASE = "https://data.sec.gov"
 
 # GAAP concepts fetched for every company in the PoC.
 POC_CONCEPTS = ["Revenues", "NetIncomeLoss", "Assets", "Liabilities"]
+
+# Minimum seconds between outgoing HTTP requests.
+# The SEC enforces a limit of 10 requests/second; 0.11 s gives a safe margin.
+_REQUEST_DELAY_SECONDS = 0.11
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +90,11 @@ class EdgarClient:
         """
         Perform a GET request and return the parsed JSON body.
 
+        A fixed delay of ``_REQUEST_DELAY_SECONDS`` is observed *before*
+        every request so the caller never exceeds the SEC rate limit of
+        10 requests per second, even when many concepts are fetched in a
+        tight loop.
+
         Parameters:
             url: Absolute URL to request.
 
@@ -94,6 +104,7 @@ class EdgarClient:
         Raises:
             httpx.HTTPStatusError: On 4xx/5xx responses.
         """
+        time.sleep(_REQUEST_DELAY_SECONDS)
         with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
             response = client.get(url)
             response.raise_for_status()
@@ -138,19 +149,26 @@ class EdgarClient:
         concept: str,
         taxonomy: str = "us-gaap",
         unit: str = "USD",
+        since_date: date | None = None,
+        forms: set[str] | None = None,
     ) -> ConceptFacts:
         """
         Fetch all reported values for a single XBRL concept.
 
-        Only annual (10-K) and quarterly (10-Q) filings are included.
-        Duplicate accession numbers are de-duplicated, keeping the entry
-        with the most recent period end date.
+        Only filings matching ``forms`` are included (default: 10-K and
+        10-Q).  Duplicate accession numbers are de-duplicated, keeping
+        the entry with the most recent period end date.  Entries with a
+        ``period_end`` before ``since_date`` are discarded.
 
         Parameters:
-            cik:      Company CIK.
-            concept:  GAAP XBRL tag (e.g. "Revenues").
-            taxonomy: XBRL taxonomy namespace (default "us-gaap").
-            unit:     Unit of measure to extract (default "USD").
+            cik:        Company CIK.
+            concept:    GAAP XBRL tag (e.g. "Revenues").
+            taxonomy:   XBRL taxonomy namespace (default "us-gaap").
+            unit:       Unit of measure to extract (default "USD").
+            since_date: Exclude entries whose period end is before this
+                        date.  Pass ``None`` to include all history.
+            forms:      Set of filing form types to keep.  Defaults to
+                        ``{"10-K", "10-Q"}``.
 
         Returns:
             ConceptFacts: Parsed fact entries for the concept.
@@ -158,6 +176,9 @@ class EdgarClient:
         Raises:
             KeyError: If the concept or unit is not present in the data.
         """
+        if forms is None:
+            forms = {"10-K", "10-Q"}
+
         padded = self._pad_cik(cik)
         url = (
             f"{_EDGAR_BASE}/api/xbrl/companyconcept/"
@@ -169,11 +190,16 @@ class EdgarClient:
             data.get("units", {}).get(unit, [])
         )
 
-        # Keep only annual and quarterly filings; drop instant-only entries.
+        # Keep only requested form types; require a period end date.
         filtered = [
             e for e in raw_entries
-            if e.get("form") in {"10-K", "10-Q"} and "end" in e
+            if e.get("form") in forms and "end" in e
         ]
+
+        # Apply optional date cut-off.
+        if since_date is not None:
+            cutoff = since_date.isoformat()
+            filtered = [e for e in filtered if e["end"] >= cutoff]
 
         # De-duplicate by accession number; keep the latest period end.
         seen: dict[str, dict[str, Any]] = {}
@@ -185,7 +211,12 @@ class EdgarClient:
         entries = [FactEntry(**e) for e in seen.values()]
         return ConceptFacts(concept=concept, unit=unit, entries=entries)
 
-    def fetch_all_poc_facts(self, cik: str) -> list[ConceptFacts]:
+    def fetch_all_poc_facts(
+        self,
+        cik: str,
+        since_date: date | None = None,
+        forms: set[str] | None = None,
+    ) -> list[ConceptFacts]:
         """
         Fetch all PoC XBRL concepts for a company.
 
@@ -193,7 +224,11 @@ class EdgarClient:
         (e.g. some REITs use non-standard tags for revenue).
 
         Parameters:
-            cik: Company CIK.
+            cik:        Company CIK.
+            since_date: Earliest period end date to include (passed
+                        through to :meth:`fetch_concept_facts`).
+            forms:      Filing form types to include (passed through to
+                        :meth:`fetch_concept_facts`).
 
         Returns:
             list[ConceptFacts]: One entry per successfully fetched concept.
@@ -201,7 +236,14 @@ class EdgarClient:
         results: list[ConceptFacts] = []
         for concept in POC_CONCEPTS:
             try:
-                results.append(self.fetch_concept_facts(cik, concept))
+                results.append(
+                    self.fetch_concept_facts(
+                        cik,
+                        concept,
+                        since_date=since_date,
+                        forms=forms,
+                    )
+                )
             except (httpx.HTTPStatusError, KeyError):
                 # Concept not available for this company – skip gracefully.
                 pass

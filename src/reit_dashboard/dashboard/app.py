@@ -2,7 +2,7 @@
 Streamlit dashboard for REIT financial data analysis.
 
 Run with:
-    streamlit run src/reit_dashboard/dashboard/app.py
+    uv run streamlit run src/reit_dashboard/dashboard/app.py
 
 Reads data from the local database (configured via DATABASE_URL env var).
 Assumes the database has been seeded via scripts/ingest_poc.py.
@@ -84,6 +84,9 @@ def load_facts(
     """
     Load financial facts for the selected companies and filters.
 
+    Adds a ``quarter_label`` column (e.g. "2022-Q3") derived from the
+    period end date for use in quarterly charts.
+
     Parameters:
         session_factory: SQLAlchemy sessionmaker.
         ciks:            List of CIKs to include.
@@ -93,7 +96,8 @@ def load_facts(
         end_date:        Latest period_end to include.
 
     Returns:
-        pd.DataFrame: Columns cik, company_name, concept, period_end, value, unit.
+        pd.DataFrame: Columns cik, company_name, concept, period_end,
+            quarter_label, value, unit.
     """
     rows: list[dict] = []
     with session_factory() as session:
@@ -120,38 +124,155 @@ def load_facts(
                         "unit": f.unit,
                     }
                 )
-    return pd.DataFrame(rows)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["period_end"] = pd.to_datetime(df["period_end"])
+    # Quarter label: "YYYY-Qn" for axis readability.
+    df["quarter_label"] = (
+        df["period_end"].dt.year.astype(str)
+        + "-Q"
+        + df["period_end"].dt.quarter.astype(str)
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Chart helper
+# Chart helpers
 # ---------------------------------------------------------------------------
 
+_CONCEPT_LABELS: dict[str, str] = {
+    "Revenues": "Revenue (USD)",
+    "NetIncomeLoss": "Net Income / Loss (USD)",
+    "Assets": "Total Assets (USD)",
+    "Liabilities": "Total Liabilities (USD)",
+}
 
-def build_time_series_chart(df: pd.DataFrame, concept: str) -> alt.Chart:
+
+def build_trend_chart(df: pd.DataFrame, concept: str) -> alt.Chart:
     """
-    Build an Altair line chart for the given financial concept data.
+    Build an Altair multi-line trend chart over time.
 
     Parameters:
-        df:      DataFrame with columns company_name, period_end, value.
-        concept: Label used in the chart title and Y-axis.
+        df:      DataFrame with company_name, period_end, value columns.
+        concept: XBRL concept name used for axis labels.
 
     Returns:
-        alt.Chart: Interactive line chart.
+        alt.Chart: Interactive line + point chart.
     """
-    chart = (
+    y_label = _CONCEPT_LABELS.get(concept, f"{concept} (USD)")
+    return (
         alt.Chart(df)
         .mark_line(point=True)
         .encode(
-            x=alt.X("period_end:T", title="Period End"),
-            y=alt.Y("value:Q", title=f"{concept} (USD)"),
+            x=alt.X(
+                "period_end:T",
+                title="Period End",
+                axis=alt.Axis(format="%b %Y", labelAngle=-45),
+            ),
+            y=alt.Y("value:Q", title=y_label, axis=alt.Axis(format="~s")),
             color=alt.Color("company_name:N", title="Company"),
-            tooltip=["company_name", "period_end", "value", "unit"],
+            tooltip=[
+                alt.Tooltip("company_name:N", title="Company"),
+                alt.Tooltip("quarter_label:N", title="Quarter"),
+                alt.Tooltip("value:Q", title="Value (USD)", format=",.0f"),
+            ],
         )
-        .properties(title=f"{concept} over time", width=700, height=350)
+        .properties(
+            title=f"{concept} – quarterly trend",
+            height=380,
+        )
         .interactive()
     )
-    return chart
+
+
+def build_bar_chart(df: pd.DataFrame, concept: str) -> alt.Chart:
+    """
+    Build a grouped bar chart comparing companies per quarter.
+
+    Parameters:
+        df:      DataFrame with company_name, quarter_label, value columns.
+        concept: XBRL concept name used for axis labels.
+
+    Returns:
+        alt.Chart: Grouped bar chart.
+    """
+    y_label = _CONCEPT_LABELS.get(concept, f"{concept} (USD)")
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X(
+                "quarter_label:O",
+                title="Quarter",
+                sort=sorted(df["quarter_label"].unique()),
+                axis=alt.Axis(labelAngle=-45),
+            ),
+            y=alt.Y("value:Q", title=y_label, axis=alt.Axis(format="~s")),
+            color=alt.Color("company_name:N", title="Company"),
+            xOffset="company_name:N",
+            tooltip=[
+                alt.Tooltip("company_name:N", title="Company"),
+                alt.Tooltip("quarter_label:N", title="Quarter"),
+                alt.Tooltip("value:Q", title="Value (USD)", format=",.0f"),
+            ],
+        )
+        .properties(
+            title=f"{concept} – quarterly comparison",
+            height=380,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metrics helpers
+# ---------------------------------------------------------------------------
+
+
+def render_metrics(df: pd.DataFrame, companies_df: pd.DataFrame) -> None:
+    """
+    Render a row of Streamlit metric cards (latest value + YoY change).
+
+    Shows one card per selected company with the most recent reported
+    value and the year-over-year change (same quarter, prior year).
+
+    Parameters:
+        df:           Facts DataFrame (already filtered by concept/form).
+        companies_df: Company metadata DataFrame.
+    """
+    cik_to_name = companies_df.set_index("cik")["name"].to_dict()
+    cols = st.columns(len(df["cik"].unique()))
+
+    for col, cik in zip(cols, sorted(df["cik"].unique())):
+        company_df = df[df["cik"] == cik].sort_values("period_end")
+        if company_df.empty:
+            continue
+
+        latest = company_df.iloc[-1]
+        latest_val = latest["value"]
+        latest_quarter = latest["quarter_label"]
+
+        # Find the same quarter one year prior for YoY delta.
+        one_year_ago = latest["period_end"] - pd.DateOffset(years=1)
+        prior = company_df[
+            (company_df["period_end"] >= one_year_ago - pd.Timedelta(days=45))
+            & (company_df["period_end"] <= one_year_ago + pd.Timedelta(days=45))
+        ]
+        delta_str: str | None = None
+        if not prior.empty:
+            prior_val = prior.iloc[-1]["value"]
+            if prior_val != 0:
+                pct = (latest_val - prior_val) / abs(prior_val) * 100
+                delta_str = f"{pct:+.1f}% YoY"
+
+        col.metric(
+            label=cik_to_name.get(cik, cik),
+            value=f"${latest_val / 1e6:,.1f}M",
+            delta=delta_str,
+            help=f"Latest: {latest_quarter}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -167,15 +288,17 @@ def main() -> None:
         layout="wide",
     )
     st.title("🏢 US REIT Financial Dashboard")
-    st.caption("Data sourced from SEC EDGAR · PoC – 5 companies")
+    st.caption(
+        "Data sourced from SEC EDGAR · Quarterly (10-Q) · Last 5 years"
+    )
 
     session_factory = get_session_factory()
     companies_df = load_companies(session_factory)
 
     if companies_df.empty:
         st.warning(
-            "No data found. Run `python scripts/ingest_poc.py` first to "
-            "populate the database."
+            "No data found. Run `uv run python scripts/ingest_poc.py` "
+            "first to populate the database."
         )
         return
 
@@ -193,9 +316,11 @@ def main() -> None:
     concept = st.sidebar.selectbox(
         "Financial Concept",
         options=["Revenues", "NetIncomeLoss", "Assets", "Liabilities"],
+        format_func=lambda c: _CONCEPT_LABELS.get(c, c),
     )
 
-    form = st.sidebar.radio("Filing Type", options=["10-K", "10-Q"], index=0)
+    # Default to 10-Q since ingestion focuses on quarterly data.
+    form = st.sidebar.radio("Filing Type", options=["10-Q", "10-K"], index=0)
 
     default_start = date.today() - timedelta(days=365 * 5)
     start_date = st.sidebar.date_input("Start Date", value=default_start)
@@ -204,9 +329,16 @@ def main() -> None:
     # --- Company info table ---
     st.subheader("Company Overview")
     display_companies = companies_df[companies_df["cik"].isin(selected_ciks)]
-    st.dataframe(display_companies.rename(columns={
-        "cik": "CIK", "name": "Name", "sic": "SIC", "fiscal_year_end": "FY End"
-    }), use_container_width=True, hide_index=True)
+    st.dataframe(
+        display_companies.rename(columns={
+            "cik": "CIK",
+            "name": "Name",
+            "sic": "SIC",
+            "fiscal_year_end": "FY End",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     if not selected_ciks:
         st.info("Select at least one company in the sidebar.")
@@ -219,15 +351,33 @@ def main() -> None:
 
     if facts_df.empty:
         st.warning(
-            f"No {form} data found for **{concept}** in the selected period. "
-            "Try adjusting the filters or re-running ingestion."
+            f"No **{form}** data found for **{concept}** in the selected "
+            "period. Try adjusting the filters or re-running ingestion."
         )
         return
 
-    st.subheader(f"{concept} – {form} filings")
-    chart = build_time_series_chart(facts_df, concept)
-    st.altair_chart(chart, use_container_width=True)
+    # --- Metrics row ---
+    st.subheader(f"Latest {_CONCEPT_LABELS.get(concept, concept)}")
+    render_metrics(facts_df, companies_df)
 
+    st.divider()
+
+    # --- Charts ---
+    tab_trend, tab_bar = st.tabs(["📈 Trend", "📊 Quarter Comparison"])
+
+    with tab_trend:
+        st.altair_chart(
+            build_trend_chart(facts_df, concept),
+            use_container_width=True,
+        )
+
+    with tab_bar:
+        st.altair_chart(
+            build_bar_chart(facts_df, concept),
+            use_container_width=True,
+        )
+
+    # --- Raw data ---
     with st.expander("Raw Data"):
         st.dataframe(
             facts_df.rename(columns={
@@ -235,9 +385,11 @@ def main() -> None:
                 "company_name": "Company",
                 "concept": "Concept",
                 "period_end": "Period End",
+                "quarter_label": "Quarter",
                 "value": "Value (USD)",
                 "unit": "Unit",
-            }),
+            })[["CIK", "Company", "Concept", "Quarter",
+                "Period End", "Value (USD)", "Unit"]],
             use_container_width=True,
             hide_index=True,
         )

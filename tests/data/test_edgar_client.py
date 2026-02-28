@@ -2,10 +2,11 @@
 Unit tests for reit_dashboard.data.edgar_client.
 
 HTTP calls are intercepted by respx so no real network requests are made.
+time.sleep is patched to keep tests fast.
 """
 
-import json
 from datetime import date
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -19,6 +20,15 @@ from reit_dashboard.data.edgar_client import (
 )
 
 USER_AGENT = "TestSuite test@example.com"
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    """
+    Patch time.sleep globally so rate-limit delays don't slow down tests.
+    """
+    monkeypatch.setattr("reit_dashboard.data.edgar_client.time.sleep", lambda _: None)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures – minimal EDGAR JSON payloads
@@ -188,3 +198,76 @@ class TestFetchConceptFacts:
 
         assert len(results) == 1
         assert results[0].concept == "Revenues"
+
+
+class TestSinceDateFilter:
+    """Tests for the since_date parameter in fetch_concept_facts."""
+
+    @respx.mock
+    def test_since_date_excludes_old_entries(self):
+        """Entries before since_date must not appear in results."""
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/Revenues.json"
+        ).mock(return_value=httpx.Response(200, json=CONCEPT_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        # Cut-off after the 2021-12-31 entry; only 2022 entries should remain.
+        result = client.fetch_concept_facts(
+            "0001045609", "Revenues", since_date=date(2022, 1, 1)
+        )
+
+        for entry in result.entries:
+            assert entry.end >= date(2022, 1, 1)
+
+    @respx.mock
+    def test_since_date_none_keeps_all(self):
+        """When since_date is None all passing entries are returned."""
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/Revenues.json"
+        ).mock(return_value=httpx.Response(200, json=CONCEPT_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        result = client.fetch_concept_facts(
+            "0001045609", "Revenues", since_date=None
+        )
+        # 3 unique accessions (8-K filtered, duplicate merged).
+        assert len(result.entries) == 3
+
+
+class TestFormsFilter:
+    """Tests for the forms parameter in fetch_concept_facts."""
+
+    @respx.mock
+    def test_only_10q_when_forms_restricted(self):
+        """Passing forms={'10-Q'} should exclude all 10-K entries."""
+        respx.get(
+            "https://data.sec.gov/api/xbrl/companyconcept/"
+            "CIK0001045609/us-gaap/Revenues.json"
+        ).mock(return_value=httpx.Response(200, json=CONCEPT_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        result = client.fetch_concept_facts(
+            "0001045609", "Revenues", forms={"10-Q"}
+        )
+
+        assert all(e.form == "10-Q" for e in result.entries)
+
+    @respx.mock
+    def test_rate_limit_sleep_called(self, monkeypatch):
+        """time.sleep should be called once per HTTP request."""
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(
+            "reit_dashboard.data.edgar_client.time.sleep",
+            lambda s: sleep_calls.append(s),
+        )
+        respx.get(
+            "https://data.sec.gov/submissions/CIK0001045609.json"
+        ).mock(return_value=httpx.Response(200, json=SUBMISSIONS_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        client.fetch_company_info("0001045609")
+
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] > 0

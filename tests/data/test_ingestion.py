@@ -95,6 +95,16 @@ class TestIngestCompany:
         ingest_company("0001045609", client, db_session)
         client.fetch_company_info.assert_called_once_with("0001045609")
 
+    def test_since_date_passed_to_client(self, db_session):
+        """ingest_company forwards since_date to fetch_all_poc_facts."""
+        from datetime import date
+
+        client = _make_client_mock()
+        cutoff = date(2020, 1, 1)
+        ingest_company("0001045609", client, db_session, since_date=cutoff)
+        _, kwargs = client.fetch_all_poc_facts.call_args
+        assert kwargs.get("since_date") == cutoff
+
 
 class TestIngestAllPocReits:
     """Tests for the ingest_all_poc_reits function."""

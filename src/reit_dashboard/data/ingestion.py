@@ -3,7 +3,7 @@ Data ingestion service for REIT Dashboard.
 
 Orchestrates the end-to-end pipeline:
   1. Fetch company metadata from EDGAR.
-  2. Fetch XBRL financial facts for each PoC concept.
+  2. Fetch XBRL quarterly (10-Q) financial facts for the last 5 years.
   3. Validate and transform via Pydantic models.
   4. Persist to the database via repository layer.
 
@@ -11,6 +11,7 @@ This module owns the business logic; it depends on EdgarClient and the
 repository classes but does not know about HTTP or SQL details directly.
 """
 
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -31,23 +32,43 @@ POC_REITS: dict[str, str] = {
     "0000766704": "Welltower",
 }
 
+# Only quarterly filings are ingested (the dashboard focuses on quarterly data).
+_INGEST_FORMS: set[str] = {"10-Q"}
+
+
+def _five_years_ago() -> date:
+    """
+    Return the date exactly 5 years before today.
+
+    Returns:
+        date: today's date with the year decremented by 5.
+    """
+    today = date.today()
+    return today.replace(year=today.year - 5)
+
 
 def ingest_company(
     cik: str,
     client: EdgarClient,
     session: Session,
+    since_date: date | None = None,
 ) -> dict[str, int]:
     """
-    Ingest one REIT company: metadata + all PoC financial facts.
+    Ingest one REIT company: metadata + quarterly financial facts.
 
     Parameters:
-        cik:     Company CIK (raw or zero-padded).
-        client:  Configured EdgarClient instance.
-        session: Active SQLAlchemy session (not yet committed).
+        cik:        Company CIK (raw or zero-padded).
+        client:     Configured EdgarClient instance.
+        session:    Active SQLAlchemy session (not yet committed).
+        since_date: Earliest period end date to fetch.  Defaults to 5
+                    years ago so ingestion is bounded to a rolling window.
 
     Returns:
         dict: Summary with keys "facts_upserted" and "concepts_fetched".
     """
+    if since_date is None:
+        since_date = _five_years_ago()
+
     company_repo = CompanyRepository(session)
     fact_repo = FinancialFactRepository(session)
 
@@ -61,8 +82,10 @@ def ingest_company(
     )
     company_repo.upsert(company)
 
-    # --- 2. Financial facts ---
-    all_concept_facts = client.fetch_all_poc_facts(cik)
+    # --- 2. Financial facts (10-Q, last 5 years) ---
+    all_concept_facts = client.fetch_all_poc_facts(
+        cik, since_date=since_date, forms=_INGEST_FORMS
+    )
     facts_upserted = 0
 
     for concept_facts in all_concept_facts:
