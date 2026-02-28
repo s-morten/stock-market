@@ -22,6 +22,7 @@ from reit_dashboard.data.models import Base
 from reit_dashboard.data.repository import (
     CompanyRepository,
     FinancialFactRepository,
+    StockPriceRepository,
 )
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,55 @@ def load_facts(
     return df
 
 
+def load_stock_prices(
+    session_factory,
+    tickers: list[str],
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """
+    Load weekly stock prices for the given tickers from the database.
+
+    Parameters:
+        session_factory: SQLAlchemy sessionmaker.
+        tickers:         List of exchange ticker symbols.
+        start_date:      Earliest date to include.
+        end_date:        Latest date to include.
+
+    Returns:
+        pd.DataFrame: Columns ticker, date, open, high, low, close, volume.
+                      Returns empty DataFrame when no data is available.
+    """
+    if not tickers:
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    with session_factory() as session:
+        repo = StockPriceRepository(session)
+        prices = repo.get_prices_for_tickers(
+            tickers, start_date=start_date, end_date=end_date
+        )
+        for p in prices:
+            rows.append(
+                {
+                    "ticker": p.ticker,
+                    "date": p.date,
+                    "open": float(p.open),
+                    "high": float(p.high),
+                    "low": float(p.low),
+                    "close": float(p.close),
+                    "volume": p.volume,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Chart helpers
 # ---------------------------------------------------------------------------
@@ -223,6 +273,119 @@ def build_bar_chart(df: pd.DataFrame, concept: str) -> alt.Chart:
             title=f"{concept} – quarterly comparison",
             height=380,
         )
+    )
+
+def build_stock_price_chart(
+    price_df: pd.DataFrame,
+    ticker_to_name: dict[str, str],
+) -> alt.Chart:
+    """
+    Build an Altair line chart for weekly adjusted close prices.
+
+    Parameters:
+        price_df:       DataFrame with columns ticker, date, close.
+        ticker_to_name: Mapping from ticker symbol to company name.
+
+    Returns:
+        alt.Chart: Interactive multi-line price chart.
+    """
+    df = price_df.copy()
+    df["company_name"] = df["ticker"].map(
+        lambda t: ticker_to_name.get(t, t)
+    )
+    return (
+        alt.Chart(df)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X(
+                "date:T",
+                title="Week",
+                axis=alt.Axis(format="%b %Y", labelAngle=-45),
+            ),
+            y=alt.Y(
+                "close:Q",
+                title="Adjusted Close (USD)",
+                axis=alt.Axis(format="$.2f"),
+            ),
+            color=alt.Color("company_name:N", title="Company"),
+            tooltip=[
+                alt.Tooltip("company_name:N", title="Company"),
+                alt.Tooltip("ticker:N", title="Ticker"),
+                alt.Tooltip("date:T", title="Week", format="%Y-%m-%d"),
+                alt.Tooltip("close:Q", title="Close (USD)", format="$.2f"),
+                alt.Tooltip(
+                    "volume:Q", title="Volume", format=",d"
+                ),
+            ],
+        )
+        .properties(
+            title="Weekly adjusted close price – last 5 years",
+            height=380,
+        )
+        .interactive()
+    )
+
+
+def build_normalised_price_chart(
+    price_df: pd.DataFrame,
+    ticker_to_name: dict[str, str],
+) -> alt.Chart:
+    """
+    Build a base-100 normalised price chart for relative comparison.
+
+    Re-bases each series to 100 at the earliest available date so
+    companies with very different price levels can be compared directly.
+
+    Parameters:
+        price_df:       DataFrame with columns ticker, date, close.
+        ticker_to_name: Mapping from ticker symbol to company name.
+
+    Returns:
+        alt.Chart: Interactive normalised line chart.
+    """
+    df = price_df.copy()
+    df["company_name"] = df["ticker"].map(
+        lambda t: ticker_to_name.get(t, t)
+    )
+    # Compute base-100 index per ticker.
+    first_close = (
+        df.sort_values("date")
+        .groupby("ticker")["close"]
+        .first()
+        .rename("first_close")
+    )
+    df = df.merge(first_close, on="ticker")
+    df["indexed"] = df["close"] / df["first_close"] * 100
+
+    return (
+        alt.Chart(df)
+        .mark_line()
+        .encode(
+            x=alt.X(
+                "date:T",
+                title="Week",
+                axis=alt.Axis(format="%b %Y", labelAngle=-45),
+            ),
+            y=alt.Y(
+                "indexed:Q",
+                title="Relative Price (base = 100)",
+                axis=alt.Axis(format=".1f"),
+            ),
+            color=alt.Color("company_name:N", title="Company"),
+            tooltip=[
+                alt.Tooltip("company_name:N", title="Company"),
+                alt.Tooltip("date:T", title="Week", format="%Y-%m-%d"),
+                alt.Tooltip(
+                    "indexed:Q", title="Indexed Value", format=".2f"
+                ),
+                alt.Tooltip("close:Q", title="Close (USD)", format="$.2f"),
+            ],
+        )
+        .properties(
+            title="Relative price performance (base 100)",
+            height=380,
+        )
+        .interactive()
     )
 
 
@@ -335,6 +498,7 @@ def main() -> None:
             "name": "Name",
             "sic": "SIC",
             "fiscal_year_end": "FY End",
+            "ticker": "Ticker",
         }),
         use_container_width=True,
         hide_index=True,
@@ -344,55 +508,132 @@ def main() -> None:
         st.info("Select at least one company in the sidebar.")
         return
 
+    # Build ticker → name mapping for selected companies.
+    ticker_to_name: dict[str, str] = {}
+    selected_tickers: list[str] = []
+    for _, row in display_companies.iterrows():
+        if row.get("ticker"):
+            ticker_to_name[row["ticker"]] = row["name"]
+            selected_tickers.append(row["ticker"])
+
     # --- Financial facts ---
     facts_df = load_facts(
         session_factory, selected_ciks, concept, form, start_date, end_date
     )
+
+    # --- Stock prices ---
+    price_df = load_stock_prices(
+        session_factory, selected_tickers, start_date, end_date
+    )
+
+    # ================================================================== #
+    # Section 1 – Financial Fundamentals                                  #
+    # ================================================================== #
+    st.header("📊 Financial Fundamentals")
 
     if facts_df.empty:
         st.warning(
             f"No **{form}** data found for **{concept}** in the selected "
             "period. Try adjusting the filters or re-running ingestion."
         )
-        return
+    else:
+        # Metrics row
+        st.subheader(f"Latest {_CONCEPT_LABELS.get(concept, concept)}")
+        render_metrics(facts_df, companies_df)
 
-    # --- Metrics row ---
-    st.subheader(f"Latest {_CONCEPT_LABELS.get(concept, concept)}")
-    render_metrics(facts_df, companies_df)
+        st.divider()
 
-    st.divider()
+        tab_trend, tab_bar = st.tabs(["📈 Trend", "📊 Quarter Comparison"])
+        with tab_trend:
+            st.altair_chart(
+                build_trend_chart(facts_df, concept),
+                use_container_width=True,
+            )
+        with tab_bar:
+            st.altair_chart(
+                build_bar_chart(facts_df, concept),
+                use_container_width=True,
+            )
 
-    # --- Charts ---
-    tab_trend, tab_bar = st.tabs(["📈 Trend", "📊 Quarter Comparison"])
+        with st.expander("Raw Financial Data"):
+            st.dataframe(
+                facts_df.rename(columns={
+                    "cik": "CIK",
+                    "company_name": "Company",
+                    "concept": "Concept",
+                    "period_end": "Period End",
+                    "quarter_label": "Quarter",
+                    "value": "Value (USD)",
+                    "unit": "Unit",
+                })[["CIK", "Company", "Concept", "Quarter",
+                    "Period End", "Value (USD)", "Unit"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    with tab_trend:
-        st.altair_chart(
-            build_trend_chart(facts_df, concept),
-            use_container_width=True,
+    # ================================================================== #
+    # Section 2 – Stock Prices                                           #
+    # ================================================================== #
+    st.header("💹 Stock Prices")
+
+    if price_df.empty:
+        st.warning(
+            "No stock price data found for the selected period. "
+            "Run `uv run python scripts/ingest_poc.py` to populate prices."
         )
+    else:
+        # Latest price metrics
+        price_cols = st.columns(len(price_df["ticker"].unique()))
+        for col, ticker in zip(
+            price_cols, sorted(price_df["ticker"].unique())
+        ):
+            t_df = price_df[price_df["ticker"] == ticker].sort_values("date")
+            latest_price = t_df.iloc[-1]["close"]
+            # WoW change
+            delta_str: str | None = None
+            if len(t_df) >= 2:
+                prior_price = t_df.iloc[-2]["close"]
+                if prior_price != 0:
+                    wow = (latest_price - prior_price) / prior_price * 100
+                    delta_str = f"{wow:+.2f}% WoW"
+            col.metric(
+                label=f"{ticker_to_name.get(ticker, ticker)} ({ticker})",
+                value=f"${latest_price:,.2f}",
+                delta=delta_str,
+                help=f"Week of {t_df.iloc[-1]['date'].date()}",
+            )
 
-    with tab_bar:
-        st.altair_chart(
-            build_bar_chart(facts_df, concept),
-            use_container_width=True,
-        )
+        st.divider()
 
-    # --- Raw data ---
-    with st.expander("Raw Data"):
-        st.dataframe(
-            facts_df.rename(columns={
-                "cik": "CIK",
-                "company_name": "Company",
-                "concept": "Concept",
-                "period_end": "Period End",
-                "quarter_label": "Quarter",
-                "value": "Value (USD)",
-                "unit": "Unit",
-            })[["CIK", "Company", "Concept", "Quarter",
-                "Period End", "Value (USD)", "Unit"]],
-            use_container_width=True,
-            hide_index=True,
+        tab_abs, tab_norm = st.tabs(
+            ["📈 Price History", "📊 Relative Performance"]
         )
+        with tab_abs:
+            st.altair_chart(
+                build_stock_price_chart(price_df, ticker_to_name),
+                use_container_width=True,
+            )
+        with tab_norm:
+            st.altair_chart(
+                build_normalised_price_chart(price_df, ticker_to_name),
+                use_container_width=True,
+            )
+
+        with st.expander("Raw Price Data"):
+            st.dataframe(
+                price_df.rename(columns={
+                    "ticker": "Ticker",
+                    "date": "Week",
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close (adj.)",
+                    "volume": "Volume",
+                })[["Ticker", "Week", "Open", "High",
+                    "Low", "Close (adj.)", "Volume"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 if __name__ == "__main__":

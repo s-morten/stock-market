@@ -13,6 +13,7 @@ from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     Date,
     ForeignKey,
     Integer,
@@ -49,6 +50,9 @@ class Company(Base):
     fiscal_year_end: Mapped[str | None] = mapped_column(
         String(5), nullable=True
     )
+    # Stock ticker symbol (e.g. "PLD").  Nullable because not all companies
+    # tracked via EDGAR will have a matching publicly traded ticker.
+    ticker: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     facts: Mapped[list["FinancialFact"]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
@@ -100,4 +104,57 @@ class FinancialFact(Base):
         return (
             f"<FinancialFact cik={self.cik!r} concept={self.concept!r} "
             f"period_end={self.period_end!r} value={self.value!r}>"
+        )
+
+
+class StockPrice(Base):
+    """
+    A weekly OHLCV price bar for a publicly traded REIT.
+
+    Prices are stored by ticker symbol so the table is independent of the
+    EDGAR CIK scheme and can be extended to any equity without a filing.
+    The unique constraint on (ticker, date) prevents duplicate ingestion.
+
+    Attributes:
+        id:     Surrogate primary key.
+        ticker: Exchange ticker symbol (e.g. "PLD").
+        date:   Week start date of the price bar.
+        open:   Opening price (USD).
+        high:   Intra-week high price (USD).
+        low:    Intra-week low price (USD).
+        close:  Adjusted closing price (USD, split- and dividend-adjusted).
+        volume: Total shares traded during the week.
+    """
+
+    __tablename__ = "stock_prices"
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker", "date",
+            name="uq_stock_price_ticker_date",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    ticker: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    open: Mapped[Decimal] = mapped_column(
+        Numeric(precision=12, scale=4), nullable=False
+    )
+    high: Mapped[Decimal] = mapped_column(
+        Numeric(precision=12, scale=4), nullable=False
+    )
+    low: Mapped[Decimal] = mapped_column(
+        Numeric(precision=12, scale=4), nullable=False
+    )
+    close: Mapped[Decimal] = mapped_column(
+        Numeric(precision=12, scale=4), nullable=False
+    )
+    volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    def __repr__(self) -> str:
+        return (
+            f"<StockPrice ticker={self.ticker!r} date={self.date!r}"
+            f" close={self.close!r}>"
         )

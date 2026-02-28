@@ -9,10 +9,11 @@ from decimal import Decimal
 
 import pytest
 
-from reit_dashboard.data.models import Company, FinancialFact
+from reit_dashboard.data.models import Company, FinancialFact, StockPrice
 from reit_dashboard.data.repository import (
     CompanyRepository,
     FinancialFactRepository,
+    StockPriceRepository,
 )
 
 
@@ -161,4 +162,92 @@ class TestFinancialFactRepository:
         db_session.commit()
 
         result = repo.get_all_facts()
+        assert len(result) == 2
+
+
+def _stock_price(
+    ticker: str = "PLD",
+    dt: date = date(2024, 1, 1),
+    close: Decimal = Decimal("100.00"),
+) -> StockPrice:
+    return StockPrice(
+        ticker=ticker,
+        date=dt,
+        open=Decimal("98.00"),
+        high=Decimal("105.00"),
+        low=Decimal("97.00"),
+        close=close,
+        volume=1_000_000,
+    )
+
+
+class TestStockPriceRepository:
+    """Tests for StockPriceRepository CRUD operations."""
+
+    def test_upsert_inserts_new_price(self, db_session):
+        """upsert on a new (ticker, date) inserts the row."""
+        repo = StockPriceRepository(db_session)
+        repo.upsert(_stock_price())
+        db_session.commit()
+
+        result = repo.get_prices("PLD")
+        assert len(result) == 1
+
+    def test_upsert_updates_existing_price(self, db_session):
+        """upsert with the same (ticker, date) updates the close value."""
+        repo = StockPriceRepository(db_session)
+        repo.upsert(_stock_price(close=Decimal("100.00")))
+        db_session.commit()
+
+        repo.upsert(_stock_price(close=Decimal("115.00")))
+        db_session.commit()
+
+        result = repo.get_prices("PLD")
+        assert len(result) == 1
+        assert result[0].close == Decimal("115.00")
+
+    def test_get_prices_empty_for_unknown_ticker(self, db_session):
+        """get_prices returns [] when ticker has no data."""
+        repo = StockPriceRepository(db_session)
+        assert repo.get_prices("UNKNOWN") == []
+
+    def test_get_prices_filter_by_date_range(self, db_session):
+        """start_date and end_date filters are applied correctly."""
+        repo = StockPriceRepository(db_session)
+        repo.upsert(_stock_price(dt=date(2020, 1, 1)))
+        repo.upsert(_stock_price(dt=date(2023, 6, 1)))
+        repo.upsert(_stock_price(dt=date(2024, 1, 1)))
+        db_session.commit()
+
+        result = repo.get_prices(
+            "PLD",
+            start_date=date(2023, 1, 1),
+            end_date=date(2023, 12, 31),
+        )
+        assert len(result) == 1
+        assert result[0].date == date(2023, 6, 1)
+
+    def test_get_prices_ordered_by_date(self, db_session):
+        """Results are ordered by date ascending."""
+        repo = StockPriceRepository(db_session)
+        repo.upsert(_stock_price(dt=date(2024, 3, 1)))
+        repo.upsert(_stock_price(dt=date(2024, 1, 1)))
+        repo.upsert(_stock_price(dt=date(2024, 2, 1)))
+        db_session.commit()
+
+        result = repo.get_prices("PLD")
+        dates = [r.date for r in result]
+        assert dates == sorted(dates)
+
+    def test_get_prices_for_tickers_multi_ticker(self, db_session):
+        """get_prices_for_tickers returns data for all requested tickers."""
+        repo = StockPriceRepository(db_session)
+        repo.upsert(_stock_price(ticker="PLD"))
+        repo.upsert(_stock_price(ticker="O"))
+        repo.upsert(_stock_price(ticker="SPG"))
+        db_session.commit()
+
+        result = repo.get_prices_for_tickers(["PLD", "O"])
+        tickers = {r.ticker for r in result}
+        assert tickers == {"PLD", "O"}
         assert len(result) == 2

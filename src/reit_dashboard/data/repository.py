@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from reit_dashboard.data.models import Company, FinancialFact
+from reit_dashboard.data.models import Company, FinancialFact, StockPrice
 
 
 class CompanyRepository:
@@ -161,4 +161,106 @@ class FinancialFactRepository:
         if form is not None:
             stmt = stmt.where(FinancialFact.form == form)
         stmt = stmt.order_by(FinancialFact.cik, FinancialFact.period_end)
+        return list(self._session.scalars(stmt))
+
+
+class StockPriceRepository:
+    """
+    Handles persistence for StockPrice records.
+
+    Parameters:
+        session: An active SQLAlchemy Session.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert(self, price: StockPrice) -> None:
+        """
+        Insert or update a weekly stock price bar.
+
+        The unique constraint (ticker, date) determines whether this is
+        an insert or an update of the close/ohlcv values.
+
+        Parameters:
+            price: StockPrice ORM instance to persist.
+        """
+        stmt = (
+            sqlite_insert(StockPrice)
+            .values(
+                ticker=price.ticker,
+                date=price.date,
+                open=price.open,
+                high=price.high,
+                low=price.low,
+                close=price.close,
+                volume=price.volume,
+            )
+            .on_conflict_do_update(
+                index_elements=["ticker", "date"],
+                set_={
+                    "open": price.open,
+                    "high": price.high,
+                    "low": price.low,
+                    "close": price.close,
+                    "volume": price.volume,
+                },
+            )
+        )
+        self._session.execute(stmt)
+
+    def get_prices(
+        self,
+        ticker: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[StockPrice]:
+        """
+        Query weekly price bars for a single ticker.
+
+        Parameters:
+            ticker:     Exchange ticker symbol.
+            start_date: Include only bars with date >= start_date.
+            end_date:   Include only bars with date <= end_date.
+
+        Returns:
+            list[StockPrice]: Matching rows ordered by date ascending.
+        """
+        stmt = (
+            select(StockPrice)
+            .where(StockPrice.ticker == ticker)
+            .order_by(StockPrice.date)
+        )
+        if start_date is not None:
+            stmt = stmt.where(StockPrice.date >= start_date)
+        if end_date is not None:
+            stmt = stmt.where(StockPrice.date <= end_date)
+        return list(self._session.scalars(stmt))
+
+    def get_prices_for_tickers(
+        self,
+        tickers: list[str],
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[StockPrice]:
+        """
+        Query weekly price bars for multiple tickers at once.
+
+        Parameters:
+            tickers:    List of exchange ticker symbols.
+            start_date: Include only bars with date >= start_date.
+            end_date:   Include only bars with date <= end_date.
+
+        Returns:
+            list[StockPrice]: Matching rows ordered by ticker, date.
+        """
+        stmt = (
+            select(StockPrice)
+            .where(StockPrice.ticker.in_(tickers))
+            .order_by(StockPrice.ticker, StockPrice.date)
+        )
+        if start_date is not None:
+            stmt = stmt.where(StockPrice.date >= start_date)
+        if end_date is not None:
+            stmt = stmt.where(StockPrice.date <= end_date)
         return list(self._session.scalars(stmt))
