@@ -28,6 +28,19 @@ def get_database_url() -> str:
     return os.getenv("DATABASE_URL", "sqlite:///./reit_data.db")
 
 
+def get_gemini_api_key() -> str | None:
+    """
+    Return the Google Gemini API key, or ``None`` if not configured.
+
+    When ``None`` is returned the Gemini-based property extraction is
+    skipped silently; all other ingestion still runs.
+
+    Returns:
+        str | None: API key string, or ``None`` if the variable is unset.
+    """
+    return os.getenv("GEMINI_API_KEY") or None
+
+
 def get_edgar_user_agent() -> str:
     """
     Return the User-Agent string required by the SEC EDGAR API.

@@ -1,9 +1,10 @@
 """
-Standalone script – run the Item 2 HTML property parser for all PoC REITs
-and write the extracted records to a JSON file.
+Standalone script – run the Item 2 HTML property parser for all PoC REITs,
+optionally call Gemini to extract total property counts, and write results
+to output files.
 
-No database interaction; results go to a local file so you can inspect
-what the parser finds without touching the database.
+No database interaction; results go to local files so you can inspect
+what the parser and Gemini find without touching the database.
 
 Usage
 -----
@@ -17,8 +18,9 @@ Output
 Options (environment variables)
 --------------------------------
     EDGAR_USER_AGENT   Required – your "Name email@example.com" identifier.
+    GEMINI_API_KEY     Optional – enables Gemini property count extraction.
     EXTRACT_OUTPUT     Output file path (default: property_extract.json).
-    EXTRACT_FORMS      Comma-separated form types (default: 10-K,10-Q).
+    EXTRACT_FORMS      Comma-separated form types (default: 10-K).
     EXTRACT_MAX        Max filings per company (default: 5).
 """
 
@@ -32,17 +34,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import os
 
-from reit_dashboard.config import get_edgar_user_agent
+from reit_dashboard.config import get_edgar_user_agent, get_gemini_api_key
 from reit_dashboard.data.edgar_client import EdgarClient
 from reit_dashboard.data.ingestion import POC_REITS, POC_TICKERS
-from reit_dashboard.data.property_parser import extract_property_data, property_result_to_rows
+from reit_dashboard.data.property_parser import (
+    extract_item2_tables_text,
+    extract_property_data,
+    property_result_to_rows,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 OUTPUT_PATH = Path(os.getenv("EXTRACT_OUTPUT", "property_extract.json"))
-FORMS = set(os.getenv("EXTRACT_FORMS", "10-K,10-Q").split(","))
+FORMS = set(os.getenv("EXTRACT_FORMS", "10-K").split(","))
 MAX_FILINGS = int(os.getenv("EXTRACT_MAX", "5"))
 SINCE_DATE = date.today() - timedelta(days=5 * 365)
 
@@ -54,16 +60,25 @@ def _print(msg: str) -> None:
 
 def run_extraction() -> list[dict]:
     """
-    Fetch filings for all PoC REITs, run the HTML parser, and return
-    a list of structured result dicts.
+    Fetch filings for all PoC REITs, run the HTML parser and optionally
+    Gemini extraction, and return a list of structured result dicts.
 
     Returns:
-        list[dict]: One entry per filing attempted, with keys:
-            ticker, cik, accn, form, period_end, status,
-            records_found, rows (list of flat row dicts).
+        list[dict]: One entry per company, with ``filings`` list containing
+            per-filing results including optional ``gemini_count``.
     """
     user_agent = get_edgar_user_agent()
     client = EdgarClient(user_agent=user_agent)
+
+    # Set up Gemini extractor if API key is available.
+    gemini_extractor = None
+    gemini_key = get_gemini_api_key()
+    if gemini_key:
+        from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
+        gemini_extractor = GeminiPropertyExtractor(api_key=gemini_key)
+        _print("Gemini API key found – property count extraction enabled.")
+    else:
+        _print("No GEMINI_API_KEY set – skipping Gemini extraction.")
 
     all_results: list[dict] = []
 
@@ -113,6 +128,8 @@ def run_extraction() -> list[dict]:
                 "primary_doc": primary_doc,
                 "status": "ok",
                 "records_found": 0,
+                "gemini_count": None,
+                "gemini_notes": None,
                 "rows": [],
             }
 
@@ -126,7 +143,26 @@ def run_extraction() -> list[dict]:
                 company_results.append(entry)
                 continue
 
-            # Parse Item 2
+            # Gemini property count extraction
+            if gemini_extractor is not None:
+                tables_text = extract_item2_tables_text(html)
+                if tables_text:
+                    try:
+                        _print("    GEMINI: sending tables to Gemini...")
+                        gemini_result = gemini_extractor.extract_property_count(tables_text)
+                        entry["gemini_count"] = gemini_result.get("total_properties")
+                        entry["gemini_notes"] = gemini_result.get("notes", "")
+                        _print(
+                            f"    GEMINI: total_properties={entry['gemini_count']} "
+                            f"– {entry['gemini_notes']}"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _print(f"    GEMINI ERROR: {exc}")
+                        entry["gemini_notes"] = f"error: {exc}"
+                else:
+                    _print("    GEMINI: no Item 2 tables found to send")
+
+            # Parse Item 2 rows (structural breakdown)
             result = extract_property_data(html, accn, form)
             entry["records_found"] = len(result.records)
             entry["headers"] = result.headers
@@ -135,13 +171,7 @@ def run_extraction() -> list[dict]:
                 _print("    PARSE: no property table found")
                 entry["status"] = "no_table"
             else:
-                _print(f"    PARSE: {len(result.records)} property type(s) found")
-                for rec in result.records:
-                    metrics_str = ", ".join(
-                        f"{k}={v}" for k, v in rec.metrics.items()
-                    )
-                    _print(f"      • {rec.property_type}: {metrics_str}")
-
+                _print(f"    PARSE: {len(result.records)} property row(s) found")
                 rows = property_result_to_rows(result, cik, ticker, period_end)
                 entry["rows"] = rows
 
@@ -164,6 +194,7 @@ def _write_summary(results: list[dict], txt_path: Path) -> None:
     total_filings = 0
     total_parsed = 0
     total_rows = 0
+    total_gemini = 0
 
     for company in results:
         name = company["name"]
@@ -171,29 +202,37 @@ def _write_summary(results: list[dict], txt_path: Path) -> None:
         filings = company.get("filings", [])
         parsed = [f for f in filings if f.get("records_found", 0) > 0]
         rows = sum(len(f.get("rows", [])) for f in filings)
+        gemini_hits = [f for f in filings if f.get("gemini_count") is not None]
 
         lines.append(f"{name} ({ticker})")
         lines.append(f"  Filings processed : {len(filings)}")
         lines.append(f"  Filings parsed    : {len(parsed)}")
+        lines.append(f"  Gemini extractions: {len(gemini_hits)}")
         lines.append(f"  Data rows         : {rows}")
 
-        for f in parsed:
-            lines.append(f"  [{f['form']}] {f['period_end']}  ({f['records_found']} types)")
-            for row in f.get("rows", []):
-                lines.append(
-                    f"    {row['property_type']:<30} "
-                    f"{row['metric_name']:<25} = {row['value']}"
+        for f in filings:
+            if f.get("gemini_count") is not None or f.get("records_found", 0) > 0:
+                gemini_str = (
+                    f"  Gemini={f['gemini_count']}" if f.get("gemini_count") is not None else ""
                 )
+                lines.append(
+                    f"  [{f['form']}] {f['period_end']}"
+                    f"  ({f.get('records_found', 0)} rows){gemini_str}"
+                )
+                if f.get("gemini_notes"):
+                    lines.append(f"    note: {f['gemini_notes']}")
         lines.append("")
 
         total_filings += len(filings)
         total_parsed += len(parsed)
         total_rows += rows
+        total_gemini += len(gemini_hits)
 
     lines += [
         "-" * 70,
         f"Total filings processed : {total_filings}",
         f"Total filings parsed    : {total_parsed}",
+        f"Total Gemini extractions: {total_gemini}",
         f"Total data rows         : {total_rows}",
     ]
     txt_path.write_text("\n".join(lines), encoding="utf-8")

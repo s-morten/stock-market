@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
-from reit_dashboard.config import get_database_url, get_edgar_user_agent
+from reit_dashboard.config import get_database_url, get_edgar_user_agent, get_gemini_api_key
 from reit_dashboard.data.edgar_client import EdgarClient
 from reit_dashboard.data.ingestion import (
     ingest_all_poc_reits,
@@ -115,19 +115,33 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------ #
-    # 3. EDGAR HTML: Item 2 property tables (10-K/10-Q, last 5 years)    #
+    # 3. EDGAR HTML: Item 2 property tables + Gemini property counts      #
     # ------------------------------------------------------------------ #
-    with SessionFactory() as session:
-        print("\n=== Property data ingestion (Item 2 HTML parser) ===\n")
-        property_results = ingest_all_property_data(edgar_client, session)
+    gemini_extractor = None
+    gemini_key = get_gemini_api_key()
+    if gemini_key:
+        from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
+        gemini_extractor = GeminiPropertyExtractor(api_key=gemini_key)
+        print("\n=== Property data ingestion (Item 2 HTML + Gemini) ===\n")
+    else:
+        print(
+            "\n=== Property data ingestion (Item 2 HTML, no Gemini key set) ===\n"
+            "  Set GEMINI_API_KEY in .env to enable Gemini property count extraction.\n"
+        )
 
-    print(f"{'Company':<30} {'Filings':>8} {'Parsed':>8} {'Rows':>8}  Status")
-    print("-" * 70)
+    with SessionFactory() as session:
+        property_results = ingest_all_property_data(
+            edgar_client, session, gemini_extractor=gemini_extractor
+        )
+
+    print(f"{'Company':<30} {'Filings':>8} {'Parsed':>8} {'Rows':>8} {'Gemini':>8}  Status")
+    print("-" * 78)
     for r in property_results:
         status = f"ERROR: {r['error']}" if r["error"] else "OK"
         print(
             f"{r['name']:<30} {r['filings_processed']:>8} "
-            f"{r['filings_parsed']:>8} {r['rows_upserted']:>8}  {status}"
+            f"{r['filings_parsed']:>8} {r['rows_upserted']:>8} "
+            f"{r.get('gemini_counts', 0):>8}  {status}"
         )
 
     all_results = edgar_results + stock_results + property_results

@@ -367,3 +367,77 @@ def property_result_to_rows(
                 }
             )
     return rows
+
+
+def _table_to_text(table: Tag) -> str:
+    """
+    Convert a BeautifulSoup ``<table>`` Tag to a plain-text TSV block.
+
+    Each row is a tab-separated line; empty cells are kept as empty
+    strings so column alignment is preserved.
+
+    Parameters:
+        table: The ``<table>`` BeautifulSoup Tag.
+
+    Returns:
+        str: Plain-text representation of the table.
+    """
+    lines: list[str] = []
+    for row in table.find_all("tr"):
+        cells = [_clean_text(c.get_text()) for c in row.find_all(["th", "td"])]
+        if any(cells):  # skip completely blank rows
+            lines.append("\t".join(cells))
+    return "\n".join(lines)
+
+
+def extract_item2_tables_text(html: str, max_tables: int = 5) -> str:
+    """
+    Locate the Item 2 "Properties" section and return the text content
+    of up to *max_tables* tables following it.
+
+    The result is suitable for pasting into a language-model prompt: each
+    table is rendered as a TSV block separated by a blank line.
+
+    Parameters:
+        html:       Raw HTML (or iXBRL) text of the filing document.
+        max_tables: Maximum number of tables to include (default 5).
+
+    Returns:
+        str: Concatenated plain-text tables, or an empty string if
+        Item 2 was not found or contained no tables.
+    """
+    parser = _detect_parser(html)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(html, parser)
+
+    item2_tag = find_item2_section(soup)
+    if item2_tag is None:
+        return ""
+
+    # Walk forward from Item 2 and collect up to max_tables tables.
+    tables_found: list[str] = []
+    node: Tag | NavigableString | None = item2_tag
+    for _ in range(6):  # climb at most 6 parent levels
+        sibling = node.find_next_sibling() if hasattr(node, "find_next_sibling") else None
+        while sibling is not None:
+            if isinstance(sibling, Tag):
+                # Stop if we hit the next major item (e.g. "Item 3")
+                if sibling.name in _HEADING_TAGS or sibling.name in _FALLBACK_TAGS:
+                    text = _clean_text(sibling.get_text())
+                    if re.match(r"item\s+[3-9]", text, re.IGNORECASE) and len(text) < 200:
+                        return "\n\n".join(tables_found)
+                # Collect tables
+                if sibling.name == "table":
+                    tables_found.append(_table_to_text(sibling))
+                else:
+                    for t in sibling.find_all("table"):
+                        tables_found.append(_table_to_text(t))
+                if len(tables_found) >= max_tables:
+                    return "\n\n".join(tables_found)
+            sibling = sibling.find_next_sibling() if hasattr(sibling, "find_next_sibling") else None
+        node = getattr(node, "parent", None)
+        if node is None:
+            break
+
+    return "\n\n".join(tables_found)

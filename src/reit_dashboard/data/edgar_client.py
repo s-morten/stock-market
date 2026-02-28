@@ -22,13 +22,6 @@ _EDGAR_BASE = "https://data.sec.gov"
 # GAAP concepts fetched for every company in the PoC (all denominated in USD).
 POC_CONCEPTS = ["Revenues", "NetIncomeLoss", "Assets", "Liabilities"]
 
-# Non-monetary property-portfolio concepts; unit is auto-detected from the
-# response because different companies use different unit labels.
-POC_PROPERTY_CONCEPTS = [
-    "NumberOfRealEstateProperties",  # unit: "Property", "properties", "item", …
-    "AreaOfRealEstateProperty",      # unit: "sqft"
-]
-
 # Minimum seconds between outgoing HTTP requests.
 # The SEC enforces a limit of 10 requests/second; 0.11 s gives a safe margin.
 _REQUEST_DELAY_SECONDS = 0.11
@@ -264,20 +257,6 @@ class EdgarClient:
                 )
             except (httpx.HTTPStatusError, KeyError):
                 # Concept not available for this company – skip gracefully.
-                pass
-        # Property-portfolio concepts use non-monetary units; auto-detect.
-        for concept in POC_PROPERTY_CONCEPTS:
-            try:
-                results.append(
-                    self.fetch_concept_facts(
-                        cik,
-                        concept,
-                        unit=None,  # auto-detect unit label
-                        since_date=since_date,
-                        forms=forms,
-                    )
-                )
-            except (httpx.HTTPStatusError, KeyError):
                 pass
         return results
 

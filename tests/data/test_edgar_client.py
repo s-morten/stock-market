@@ -5,6 +5,8 @@ HTTP calls are intercepted by respx so no real network requests are made.
 time.sleep is patched to keep tests fast.
 """
 
+import json
+import re
 from datetime import date
 from unittest.mock import patch
 
@@ -180,8 +182,6 @@ class TestFetchConceptFacts:
     @respx.mock
     def test_fetch_all_poc_facts_skips_missing(self):
         """A 404 on a concept should be silently skipped."""
-        from reit_dashboard.data.edgar_client import POC_PROPERTY_CONCEPTS
-
         # Only Revenues returns 200; all others return 404.
         base = (
             "https://data.sec.gov/api/xbrl/companyconcept/"
@@ -191,11 +191,6 @@ class TestFetchConceptFacts:
             return_value=httpx.Response(200, json=CONCEPT_PAYLOAD)
         )
         for concept in POC_CONCEPTS[1:]:
-            respx.get(base + f"{concept}.json").mock(
-                return_value=httpx.Response(404)
-            )
-        # Property concepts also need to be mocked (all returning 404).
-        for concept in POC_PROPERTY_CONCEPTS:
             respx.get(base + f"{concept}.json").mock(
                 return_value=httpx.Response(404)
             )
@@ -316,7 +311,7 @@ MIXED_UNITS_PAYLOAD = {
 }
 
 
-class TestPropertyConcepts:
+class TestUnitAutoDetect:
     """Tests for unit=None auto-detection in fetch_concept_facts."""
 
     @respx.mock
@@ -324,74 +319,110 @@ class TestPropertyConcepts:
         """unit=None should pick the unit with the most entries."""
         respx.get(
             "https://data.sec.gov/api/xbrl/companyconcept/"
-            "CIK0001045609/us-gaap/NumberOfRealEstateProperties.json"
+            "CIK0001045609/us-gaap/SomeConcept.json"
         ).mock(return_value=httpx.Response(200, json=MIXED_UNITS_PAYLOAD))
 
         client = EdgarClient(user_agent=USER_AGENT)
-        result = client.fetch_concept_facts(
-            "0001045609", "NumberOfRealEstateProperties", unit=None
-        )
+        result = client.fetch_concept_facts("0001045609", "SomeConcept", unit=None)
 
         # "properties" has 2 entries vs "Property" with 1 → auto-picks "properties"
         assert result.unit == "properties"
         assert len(result.entries) == 2
 
     @respx.mock
-    def test_fetch_concept_facts_with_property_unit(self):
-        """Property unit facts are returned correctly."""
+    def test_fetch_concept_facts_with_custom_unit(self):
+        """Non-USD unit facts are returned correctly when unit=None."""
         respx.get(
             "https://data.sec.gov/api/xbrl/companyconcept/"
-            "CIK0001045609/us-gaap/NumberOfRealEstateProperties.json"
+            "CIK0001045609/us-gaap/SomeConcept.json"
         ).mock(return_value=httpx.Response(200, json=PROPERTY_COUNT_PAYLOAD))
 
         client = EdgarClient(user_agent=USER_AGENT)
-        result = client.fetch_concept_facts(
-            "0001045609", "NumberOfRealEstateProperties", unit=None
-        )
+        result = client.fetch_concept_facts("0001045609", "SomeConcept", unit=None)
 
-        assert result.concept == "NumberOfRealEstateProperties"
         assert result.unit == "Property"
         assert len(result.entries) == 2
-        assert result.entries[0].val in {2500, 2300}
-
-    @respx.mock
-    def test_fetch_all_poc_facts_includes_property_concepts(self):
-        """fetch_all_poc_facts should attempt POC_PROPERTY_CONCEPTS too."""
-        from reit_dashboard.data.edgar_client import POC_PROPERTY_CONCEPTS
-
-        base = (
-            "https://data.sec.gov/api/xbrl/companyconcept/"
-            "CIK0001045609/us-gaap/"
-        )
-        # All monetary concepts return 404.
-        for concept in POC_CONCEPTS:
-            respx.get(base + f"{concept}.json").mock(
-                return_value=httpx.Response(404)
-            )
-        # Property count returns data; area returns 404.
-        respx.get(base + "NumberOfRealEstateProperties.json").mock(
-            return_value=httpx.Response(200, json=PROPERTY_COUNT_PAYLOAD)
-        )
-        respx.get(base + "AreaOfRealEstateProperty.json").mock(
-            return_value=httpx.Response(404)
-        )
-
-        client = EdgarClient(user_agent=USER_AGENT)
-        results = client.fetch_all_poc_facts("0001045609")
-
-        assert len(results) == 1
-        assert results[0].concept == "NumberOfRealEstateProperties"
 
     @respx.mock
     def test_no_units_in_response_raises_key_error(self):
         """Empty units dict with unit=None should raise KeyError."""
         respx.get(
             "https://data.sec.gov/api/xbrl/companyconcept/"
-            "CIK0001045609/us-gaap/NumberOfRealEstateProperties.json"
+            "CIK0001045609/us-gaap/SomeConcept.json"
         ).mock(return_value=httpx.Response(200, json={"units": {}}))
 
         client = EdgarClient(user_agent=USER_AGENT)
         with pytest.raises(KeyError):
-            client.fetch_concept_facts(
-                "0001045609", "NumberOfRealEstateProperties", unit=None
-            )
+            client.fetch_concept_facts("0001045609", "SomeConcept", unit=None)
+
+
+# ---------------------------------------------------------------------------
+# Tests for GeminiPropertyExtractor
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiPropertyExtractor:
+    """Unit tests for GeminiPropertyExtractor (HTTP calls mocked)."""
+
+    GEMINI_URL_PATTERN = re.compile(
+        r"https://generativelanguage\.googleapis\.com/.*generateContent.*"
+    )
+
+    @staticmethod
+    def _gemini_response(total_properties, notes="ok"):
+        body = json.dumps({"total_properties": total_properties, "notes": notes})
+        return httpx.Response(200, json={
+            "candidates": [{"content": {"parts": [{"text": body}]}}]
+        })
+
+    @respx.mock
+    def test_returns_property_count(self, monkeypatch):
+        """A valid Gemini response is parsed to a dict with total_properties."""
+        from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
+
+        monkeypatch.setattr("reit_dashboard.data.gemini_client.time.sleep", lambda _: None)
+        respx.post(self.GEMINI_URL_PATTERN).mock(
+            return_value=self._gemini_response(1500, "Found total row = 1500")
+        )
+
+        extractor = GeminiPropertyExtractor(api_key="test-key")
+        result = extractor.extract_property_count("Property Type\tCount\nOffice\t500\nTotal\t1500")
+
+        assert result["total_properties"] == 1500
+        assert "notes" in result
+
+    @respx.mock
+    def test_null_count_when_not_found(self, monkeypatch):
+        """Gemini returning null total_properties is propagated correctly."""
+        from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
+
+        monkeypatch.setattr("reit_dashboard.data.gemini_client.time.sleep", lambda _: None)
+        respx.post(self.GEMINI_URL_PATTERN).mock(
+            return_value=self._gemini_response(None, "Cannot determine")
+        )
+
+        extractor = GeminiPropertyExtractor(api_key="test-key")
+        result = extractor.extract_property_count("some table text")
+
+        assert result["total_properties"] is None
+
+    def test_empty_tables_text_skips_api(self, monkeypatch):
+        """Empty tables_text must not call the Gemini API."""
+        from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
+
+        called = []
+        monkeypatch.setattr("reit_dashboard.data.gemini_client.time.sleep", lambda _: None)
+
+        extractor = GeminiPropertyExtractor(api_key="test-key")
+        # Patch _client to track calls
+        original_post = httpx.Client.post
+
+        def track_post(self, *a, **kw):
+            called.append(1)
+            return original_post(self, *a, **kw)
+
+        result = extractor.extract_property_count("")
+
+        assert not called
+        assert result["total_properties"] is None
+

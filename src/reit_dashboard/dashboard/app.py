@@ -704,193 +704,97 @@ def main() -> None:
     # ================================================================== #
     st.header("🏗️ Property Portfolio")
     st.caption(
-        "XBRL structured counts are fetched directly from EDGAR. "
-        "Property-type breakdown is parsed from Item 2 of SEC 10-K/10-Q filings. "
-        "Run `uv run python scripts/ingest_poc.py` to populate."
+        "Total property counts are extracted by Gemini from Item 2 of 10-K filings. "
+        "Run `uv run python scripts/ingest_poc.py` (with `GEMINI_API_KEY` set) to populate."
     )
 
-    # ------------------------------------------------------------------
-    # 3a – XBRL property count and area (structured, directly from API)
-    # ------------------------------------------------------------------
-    xbrl_prop_tab, xbrl_area_tab = st.tabs(
-        ["📦 Property Count (XBRL)", "📐 Property Area sqft (XBRL)"]
-    )
+    prop_df_all = load_property_facts(session_factory, selected_ciks)
 
-    for tab_widget, concept_name, y_title, y_fmt in [
-        (xbrl_prop_tab, "NumberOfRealEstateProperties", "Number of Properties", "~s"),
-        (xbrl_area_tab, "AreaOfRealEstateProperty", "Area (sq ft)", "~s"),
-    ]:
-        with tab_widget:
-            xbrl_df = load_facts(
-                session_factory,
-                selected_ciks,
-                concept=concept_name,
-                form="10-K",
-                start_date=start_date,
-                end_date=end_date,
+    # ------------------------------------------------------------------
+    # 3a – Gemini-extracted total property count (time-series)
+    # ------------------------------------------------------------------
+    gemini_df = pd.DataFrame()
+    if not prop_df_all.empty:
+        gemini_df = prop_df_all[
+            prop_df_all["metric_name"] == "total_properties_gemini"
+        ].copy()
+        gemini_df = gemini_df.dropna(subset=["value_numeric"])
+
+    if gemini_df.empty:
+        st.info(
+            "No Gemini property count data found. "
+            "Re-run ingestion with `GEMINI_API_KEY` set to populate."
+        )
+    else:
+        count_chart = (
+            alt.Chart(gemini_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("period_end:T", title="Period End",
+                        axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                y=alt.Y("value_numeric:Q", title="Total Properties",
+                        axis=alt.Axis(format=",.0f"), scale=alt.Scale(zero=False)),
+                color=alt.Color("company_name:N", title="Company"),
+                tooltip=[
+                    alt.Tooltip("company_name:N", title="Company"),
+                    alt.Tooltip("period_end:T", title="Period", format="%Y-%m-%d"),
+                    alt.Tooltip("value_numeric:Q", title="Total Properties",
+                                format=",.0f"),
+                ],
             )
-            if xbrl_df.empty:
-                # Try 10-Q if no 10-K data
-                xbrl_df = load_facts(
-                    session_factory,
-                    selected_ciks,
-                    concept=concept_name,
-                    form="10-Q",
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-            if xbrl_df.empty:
-                st.info(
-                    f"No XBRL data for `{concept_name}`. "
-                    "Re-run ingestion to populate."
-                )
-            else:
-                chart = (
-                    alt.Chart(xbrl_df)
-                    .mark_line(point=True)
-                    .encode(
-                        x=alt.X("period_end:T", title="Period End",
-                                axis=alt.Axis(format="%b %Y", labelAngle=-45)),
-                        y=alt.Y("value:Q", title=y_title,
-                                axis=alt.Axis(format=y_fmt)),
-                        color=alt.Color("company_name:N", title="Company"),
-                        tooltip=[
-                            alt.Tooltip("company_name:N", title="Company"),
-                            alt.Tooltip("period_end:T", title="Period",
-                                        format="%Y-%m-%d"),
-                            alt.Tooltip("value:Q", title=y_title,
-                                        format=",.0f"),
-                        ],
-                    )
-                    .properties(title=y_title, height=360)
-                    .interactive()
-                )
-                st.altair_chart(chart, use_container_width=True)
+            .properties(
+                title="Total Properties per Company (Gemini-extracted from 10-K Item 2)",
+                height=400,
+            )
+            .interactive()
+        )
+        st.altair_chart(count_chart, use_container_width=True)
+
+        # Latest snapshot table
+        latest_snap = (
+            gemini_df.sort_values("period_end")
+            .groupby("company_name")
+            .last()
+            .reset_index()[["company_name", "ticker", "period_end", "value_numeric"]]
+            .rename(columns={
+                "company_name": "Company",
+                "ticker": "Ticker",
+                "period_end": "Latest Filing",
+                "value_numeric": "Total Properties",
+            })
+        )
+        latest_snap["Total Properties"] = latest_snap["Total Properties"].astype(int)
+        st.dataframe(latest_snap, use_container_width=True, hide_index=True)
 
     st.divider()
 
     # ------------------------------------------------------------------
-    # 3b – Item 2 HTML-parsed property-type breakdown
+    # 3b – Raw Item 2 HTML-parsed data (detailed breakdown)
     # ------------------------------------------------------------------
-    st.subheader("📋 Property-Type Breakdown (Item 2 HTML parser)")
-    prop_df_all = load_property_facts(session_factory, selected_ciks)
+    with st.expander("📋 Detailed Item 2 Table Data (HTML-parsed, for reference)", expanded=False):
+        raw_df = prop_df_all[
+            prop_df_all["metric_name"] != "total_properties_gemini"
+        ] if not prop_df_all.empty else prop_df_all
 
-    if prop_df_all.empty:
-        st.info(
-            "No property-type data found. Re-run ingestion with Phase 3 "
-            "(HTML parser) to populate this section."
-        )
-    else:
-        # Metric selector based on what's in the DB for these companies.
-        available_metrics = sorted(prop_df_all["metric_name"].dropna().unique())
-        selected_metric = st.selectbox(
-            "Property Metric",
-            options=available_metrics,
-            format_func=lambda m: m.replace("_", " ").title(),
-            key="property_metric",
-        )
-
-        prop_df = prop_df_all[prop_df_all["metric_name"] == selected_metric].copy()
-        prop_df = prop_df.dropna(subset=["value_numeric"])
-
-        if prop_df.empty:
-            st.info(f"No numeric data available for metric: {selected_metric}")
+        if raw_df.empty:
+            st.info("No detailed breakdown data. Re-run ingestion to populate.")
         else:
-            tab_breakdown, tab_trend, tab_raw = st.tabs(
-                ["📊 Latest Breakdown", "📈 Trend Over Time", "🗂️ Raw Data"]
+            st.dataframe(
+                raw_df.rename(columns={
+                    "cik": "CIK",
+                    "ticker": "Ticker",
+                    "company_name": "Company",
+                    "period_end": "Period End",
+                    "form": "Form",
+                    "property_type": "Property Type",
+                    "metric_name": "Metric",
+                    "value_str": "Value (raw)",
+                    "value_numeric": "Value (numeric)",
+                })[["Company", "Ticker", "Period End", "Form",
+                    "Property Type", "Metric", "Value (raw)", "Value (numeric)"]],
+                use_container_width=True,
+                hide_index=True,
             )
-
-            with tab_breakdown:
-                # Use the most recent period per company.
-                latest_period = (
-                    prop_df.groupby("cik")["period_end"].max().reset_index()
-                )
-                latest_df = prop_df.merge(latest_period, on=["cik", "period_end"])
-                # Sum per company + property type for the latest filing.
-                bar_df = (
-                    latest_df.groupby(["company_name", "property_type"])["value_numeric"]
-                    .sum()
-                    .reset_index()
-                )
-                if not bar_df.empty:
-                    chart = (
-                        alt.Chart(bar_df)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("property_type:N", title="Property Type",
-                                    axis=alt.Axis(labelAngle=-45)),
-                            y=alt.Y("value_numeric:Q",
-                                    title=selected_metric.replace("_", " ").title(),
-                                    axis=alt.Axis(format="~s")),
-                            color=alt.Color("company_name:N", title="Company"),
-                            xOffset="company_name:N",
-                            tooltip=[
-                                alt.Tooltip("company_name:N", title="Company"),
-                                alt.Tooltip("property_type:N", title="Property Type"),
-                                alt.Tooltip("value_numeric:Q",
-                                            title=selected_metric.replace("_", " ").title(),
-                                            format=",.2f"),
-                            ],
-                        )
-                        .properties(
-                            title=f"{selected_metric.replace('_', ' ').title()} by Property Type (latest filing)",
-                            height=380,
-                        )
-                    )
-                    st.altair_chart(chart, use_container_width=True)
-
-            with tab_trend:
-                # Aggregate across property types per company per period.
-                trend_df = (
-                    prop_df.groupby(["company_name", "period_end"])["value_numeric"]
-                    .sum()
-                    .reset_index()
-                )
-                if not trend_df.empty:
-                    trend_chart = (
-                        alt.Chart(trend_df)
-                        .mark_line(point=True)
-                        .encode(
-                            x=alt.X("period_end:T", title="Period End",
-                                    axis=alt.Axis(format="%b %Y", labelAngle=-45)),
-                            y=alt.Y("value_numeric:Q",
-                                    title=selected_metric.replace("_", " ").title(),
-                                    axis=alt.Axis(format="~s")),
-                            color=alt.Color("company_name:N", title="Company"),
-                            tooltip=[
-                                alt.Tooltip("company_name:N", title="Company"),
-                                alt.Tooltip("period_end:T", title="Period",
-                                            format="%Y-%m-%d"),
-                                alt.Tooltip("value_numeric:Q",
-                                            title=selected_metric.replace("_", " ").title(),
-                                            format=",.2f"),
-                            ],
-                        )
-                        .properties(
-                            title=f"Total {selected_metric.replace('_', ' ').title()} over time",
-                            height=380,
-                        )
-                        .interactive()
-                    )
-                    st.altair_chart(trend_chart, use_container_width=True)
-
-            with tab_raw:
-                st.dataframe(
-                    prop_df.rename(columns={
-                        "cik": "CIK",
-                        "ticker": "Ticker",
-                        "company_name": "Company",
-                        "period_end": "Period End",
-                        "form": "Form",
-                        "property_type": "Property Type",
-                        "metric_name": "Metric",
-                        "value_str": "Value (raw)",
-                        "value_numeric": "Value (numeric)",
-                    })[["Company", "Ticker", "Period End", "Form",
-                        "Property Type", "Metric", "Value (raw)", "Value (numeric)"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
 
 
