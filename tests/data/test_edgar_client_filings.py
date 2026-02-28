@@ -38,6 +38,11 @@ _SUBMISSIONS_PAYLOAD = {
             "form": ["10-K", "10-Q", "8-K"],
             "filingDate": ["2024-02-15", "2023-10-25", "2023-08-01"],
             "reportDate": ["2023-12-31", "2023-09-30", ""],
+            "primaryDocument": [
+                "pld-20231231.htm",
+                "pld-20230930.htm",
+                "pld-8k.htm",
+            ],
         }
     },
 }
@@ -144,44 +149,77 @@ class TestListFilings:
             assert "form" in f
             assert "filingDate" in f
             assert "reportDate" in f
+            assert "primaryDocument" in f
+
+    @respx.mock
+    def test_primary_document_included(self):
+        """list_filings returns the primaryDocument field from submissions."""
+        respx.get(
+            "https://data.sec.gov/submissions/CIK0001045609.json"
+        ).mock(return_value=httpx.Response(200, json=_SUBMISSIONS_PAYLOAD))
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        filings = client.list_filings("0001045609", forms={"10-K"})
+
+        assert filings[0]["primaryDocument"] == "pld-20231231.htm"
 
 
 class TestFetchFilingHtml:
     @respx.mock
-    def test_happy_path(self):
+    def test_happy_path_with_primary_doc(self):
+        """When primary_doc is supplied the document is fetched directly."""
         accn = "0001045609-24-000001"
         accn_nodash = "000104560924000001"
         cik_int = 1045609
 
-        index_url = (
-            f"https://www.sec.gov/Archives/edgar/data/"
-            f"{cik_int}/{accn_nodash}/{accn_nodash}-index.json"
-        )
         doc_url = (
             f"https://www.sec.gov/Archives/edgar/data/"
             f"{cik_int}/{accn_nodash}/pld-20231231.htm"
-        )
-
-        respx.get(index_url).mock(
-            return_value=httpx.Response(200, json=_INDEX_PAYLOAD)
         )
         respx.get(doc_url).mock(
             return_value=httpx.Response(200, text="<html>filing content</html>")
         )
 
         client = EdgarClient(user_agent=USER_AGENT)
-        html = client.fetch_filing_html("0001045609", accn)
+        html = client.fetch_filing_html("0001045609", accn, primary_doc="pld-20231231.htm")
         assert "filing content" in html
 
     @respx.mock
-    def test_no_primary_doc_raises(self):
+    def test_fallback_to_index_json(self):
+        """Without primary_doc the method falls back to index.json discovery."""
         accn = "0001045609-24-000001"
         accn_nodash = "000104560924000001"
         cik_int = 1045609
 
         index_url = (
             f"https://www.sec.gov/Archives/edgar/data/"
-            f"{cik_int}/{accn_nodash}/{accn_nodash}-index.json"
+            f"{cik_int}/{accn_nodash}/index.json"
+        )
+        doc_url = (
+            f"https://www.sec.gov/Archives/edgar/data/"
+            f"{cik_int}/{accn_nodash}/pld-20231231.htm"
+        )
+        respx.get(index_url).mock(
+            return_value=httpx.Response(200, json=_INDEX_PAYLOAD)
+        )
+        respx.get(doc_url).mock(
+            return_value=httpx.Response(200, text="<html>fallback content</html>")
+        )
+
+        client = EdgarClient(user_agent=USER_AGENT)
+        html = client.fetch_filing_html("0001045609", accn)
+        assert "fallback content" in html
+
+    @respx.mock
+    def test_no_primary_doc_raises(self):
+        """ValueError when index.json has no matching HTML document."""
+        accn = "0001045609-24-000001"
+        accn_nodash = "000104560924000001"
+        cik_int = 1045609
+
+        index_url = (
+            f"https://www.sec.gov/Archives/edgar/data/"
+            f"{cik_int}/{accn_nodash}/index.json"
         )
         respx.get(index_url).mock(
             return_value=httpx.Response(

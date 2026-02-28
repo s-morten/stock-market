@@ -318,7 +318,9 @@ def ingest_property_data(
         period_end = filing.get("reportDate") or filing.get("filingDate", "")
 
         try:
-            html = client.fetch_filing_html(cik, accn)
+            html = client.fetch_filing_html(
+                cik, accn, primary_doc=filing.get("primaryDocument") or None
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch HTML for %s / %s: %s", cik, accn, exc)
             filings_processed += 1

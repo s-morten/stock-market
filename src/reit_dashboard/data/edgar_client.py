@@ -291,7 +291,13 @@ class EdgarClient:
         List filings for a company from the EDGAR submissions endpoint.
 
         Returns a list of dicts with keys:
-        ``accn``, ``form``, ``filingDate``, ``reportDate``.
+        ``accn``, ``form``, ``filingDate``, ``reportDate``,
+        ``primaryDocument``.
+
+        The ``primaryDocument`` field is the filename of the primary
+        filing document as reported by SEC EDGAR (e.g. "pld-20231231.htm").
+        It can be passed directly to :meth:`fetch_filing_html` to avoid a
+        separate index-page request.
 
         Filings are returned in reverse-chronological order (newest first).
 
@@ -317,10 +323,11 @@ class EdgarClient:
         form_list = recent.get("form", [])
         dates = recent.get("filingDate", [])
         periods = recent.get("reportDate", [])
+        primary_docs = recent.get("primaryDocument", [""] * len(accns))
 
         results: list[dict[str, str]] = []
-        for accn, form, filing_date, report_date in zip(
-            accns, form_list, dates, periods
+        for accn, form, filing_date, report_date, primary_doc in zip(
+            accns, form_list, dates, periods, primary_docs
         ):
             if form not in forms:
                 continue
@@ -332,6 +339,7 @@ class EdgarClient:
                     "form": form,
                     "filingDate": filing_date,
                     "reportDate": report_date,
+                    "primaryDocument": primary_doc or "",
                 }
             )
             if max_filings is not None and len(results) >= max_filings:
@@ -339,54 +347,65 @@ class EdgarClient:
 
         return results
 
-    def fetch_filing_html(self, cik: str, accn: str) -> str:
+    def fetch_filing_html(
+        self,
+        cik: str,
+        accn: str,
+        primary_doc: str | None = None,
+    ) -> str:
         """
         Fetch the primary HTML document for a given SEC filing.
 
-        Resolves the filing index page first, then follows the link to
-        the primary ``.htm`` / ``.html`` document.
+        When ``primary_doc`` is provided (the filename as returned by
+        :meth:`list_filings`) the document is fetched directly with a
+        single HTTP request.  When it is ``None`` the method falls back to
+        fetching the filing's ``index.json`` to discover the primary
+        document name.
 
         Parameters:
-            cik:  Company CIK (raw or zero-padded).
-            accn: Accession number (with or without dashes).
+            cik:         Company CIK (raw or zero-padded).
+            accn:        Accession number (with or without dashes).
+            primary_doc: Optional filename of the primary document
+                         (e.g. "pld-20231231.htm").
 
         Returns:
             str: Raw HTML text of the primary filing document.
 
         Raises:
             httpx.HTTPStatusError: On HTTP errors.
-            ValueError: If no primary HTML document is found in the index.
+            ValueError: If no primary HTML document can be located.
         """
         padded = self._pad_cik(cik)
         # Accession number in the URL uses no dashes.
         accn_nodash = accn.replace("-", "")
-        index_url = (
-            f"https://www.sec.gov/Archives/edgar/data/"
-            f"{int(padded)}/{accn_nodash}/{accn_nodash}-index.json"
-        )
-        time.sleep(_REQUEST_DELAY_SECONDS)
-        with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
-            resp = client.get(index_url)
-            resp.raise_for_status()
-            index = resp.json()
+        cik_int = int(padded)
+        base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accn_nodash}"
 
-        # Find the primary document (largest .htm that is not the index).
-        doc_url: str | None = None
-        for item in index.get("documents", []):
-            if item.get("type") in ("10-K", "10-Q", "10-K/A", "10-Q/A"):
-                name: str = item.get("name", "")
-                if name.lower().endswith((".htm", ".html")):
-                    doc_url = (
-                        f"https://www.sec.gov/Archives/edgar/data/"
-                        f"{int(padded)}/{accn_nodash}/{name}"
-                    )
-                    break
+        if not primary_doc:
+            # Fall back: fetch the filing index JSON to discover the filename.
+            index_url = f"{base}/index.json"
+            time.sleep(_REQUEST_DELAY_SECONDS)
+            with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
+                resp = client.get(index_url)
+                resp.raise_for_status()
+                index = resp.json()
 
-        if doc_url is None:
-            raise ValueError(
-                f"No primary HTML document found for accession {accn}"
-            )
+            # Find the primary document (.htm whose type matches the form).
+            _FORM_TYPES = {"10-K", "10-Q", "10-K/A", "10-Q/A"}
+            primary_doc = None
+            for item in index.get("documents", []):
+                if item.get("type") in _FORM_TYPES:
+                    name: str = item.get("name", "")
+                    if name.lower().endswith((".htm", ".html")):
+                        primary_doc = name
+                        break
 
+            if not primary_doc:
+                raise ValueError(
+                    f"No primary HTML document found for accession {accn}"
+                )
+
+        doc_url = f"{base}/{primary_doc}"
         time.sleep(_REQUEST_DELAY_SECONDS)
         with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
             resp = client.get(doc_url)
