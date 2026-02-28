@@ -17,7 +17,7 @@ dependencies = [
     "altair>=5.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.14",

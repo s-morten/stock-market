@@ -24,17 +24,16 @@ tests/
 ## Setup
 
 ```bash
-# 1. Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+# 1. Install dependencies (uv creates the venv and lock file automatically)
+uv sync --group dev
 
-# 2. Install the package with development dependencies
-pip install -e ".[dev]"
-
-# 3. Configure environment variables
+# 2. Configure environment variables
 cp .env.example .env
 # Edit .env and set EDGAR_USER_AGENT to identify your application.
 ```
+
+> **Requires [uv](https://docs.astral.sh/uv/).**  Install it with:
+> `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
 ## Running the PoC Ingestion
 
@@ -42,7 +41,7 @@ Fetches financial data for 5 well-known REITs from EDGAR and stores it
 in a local SQLite database:
 
 ```bash
-python scripts/ingest_poc.py
+uv run python scripts/ingest_poc.py
 ```
 
 Output example:
@@ -57,7 +56,7 @@ Realty Income                     98          4  OK
 ## Running the Dashboard
 
 ```bash
-streamlit run src/reit_dashboard/dashboard/app.py
+uv run streamlit run src/reit_dashboard/dashboard/app.py
 ```
 
 Open [http://localhost:8501](http://localhost:8501) in your browser.
@@ -66,7 +65,7 @@ Use the sidebar to filter by company, financial concept, filing type, and date r
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 ## Switching to Oracle
@@ -80,7 +79,7 @@ DATABASE_URL=oracle+oracledb://user:password@host:1521/service_name
 Also install the Oracle dialect driver:
 
 ```bash
-pip install oracledb
+uv add oracledb
 ```
 
 No code changes are required.
