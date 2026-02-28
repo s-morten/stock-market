@@ -4,6 +4,7 @@ PoC ingestion script – seeds the database with data for 5 US REITs.
 Fetches:
   - Company metadata + quarterly financial facts from SEC EDGAR
   - Weekly stock prices from Yahoo Finance (last 5 years)
+  - Property data parsed from Item 2 of 10-K/10-Q HTML filings
 
 Usage:
     uv run python scripts/ingest_poc.py
@@ -25,6 +26,7 @@ from reit_dashboard.config import get_database_url, get_edgar_user_agent
 from reit_dashboard.data.edgar_client import EdgarClient
 from reit_dashboard.data.ingestion import (
     ingest_all_poc_reits,
+    ingest_all_property_data,
     ingest_all_stock_prices,
 )
 from reit_dashboard.data.models import Base
@@ -60,7 +62,7 @@ def _apply_schema_migrations(engine) -> None:
 
 def main() -> None:
     """
-    Initialise the database and run EDGAR + stock price ingestion.
+    Initialise the database and run EDGAR + stock price + property ingestion.
 
     Prints a per-company summary table to stdout.
     """
@@ -112,7 +114,23 @@ def main() -> None:
             f"{r['prices_upserted']:>8}  {status}"
         )
 
-    all_results = edgar_results + stock_results
+    # ------------------------------------------------------------------ #
+    # 3. EDGAR HTML: Item 2 property tables (10-K/10-Q, last 5 years)    #
+    # ------------------------------------------------------------------ #
+    with SessionFactory() as session:
+        print("\n=== Property data ingestion (Item 2 HTML parser) ===\n")
+        property_results = ingest_all_property_data(edgar_client, session)
+
+    print(f"{'Company':<30} {'Filings':>8} {'Parsed':>8} {'Rows':>8}  Status")
+    print("-" * 70)
+    for r in property_results:
+        status = f"ERROR: {r['error']}" if r["error"] else "OK"
+        print(
+            f"{r['name']:<30} {r['filings_processed']:>8} "
+            f"{r['filings_parsed']:>8} {r['rows_upserted']:>8}  {status}"
+        )
+
+    all_results = edgar_results + stock_results + property_results
     errors = [r for r in all_results if r["error"]]
     if errors:
         print(f"\n{len(errors)} step(s) failed.")

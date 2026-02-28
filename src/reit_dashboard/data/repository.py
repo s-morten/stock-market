@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from reit_dashboard.data.models import Company, FinancialFact, StockPrice
+from reit_dashboard.data.models import Company, FinancialFact, PropertyFact, StockPrice
 
 
 class CompanyRepository:
@@ -264,3 +264,144 @@ class StockPriceRepository:
         if end_date is not None:
             stmt = stmt.where(StockPrice.date <= end_date)
         return list(self._session.scalars(stmt))
+
+
+class PropertyFactRepository:
+    """
+    Handles persistence for PropertyFact records.
+
+    Parameters:
+        session: An active SQLAlchemy Session.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert(self, row: dict) -> None:
+        """
+        Insert or update a single property fact row.
+
+        Matches on the unique constraint (cik, accn, property_type,
+        metric_name).  On conflict the ``value`` column is updated.
+
+        Accepts ``period_end`` as either a :class:`datetime.date` or an
+        ISO-format string; converts strings automatically.
+
+        Parameters:
+            row: Dict with keys matching PropertyFact columns.
+        """
+        # Normalise period_end to a date object (SQLite Date type requires it).
+        row = dict(row)
+        pe = row.get("period_end")
+        if isinstance(pe, str) and pe:
+            try:
+                from datetime import date as _date
+                row["period_end"] = _date.fromisoformat(pe)
+            except ValueError:
+                row["period_end"] = None
+        elif pe == "":
+            row["period_end"] = None
+
+        stmt = (
+            sqlite_insert(PropertyFact)
+            .values(**row)
+            .on_conflict_do_update(
+                index_elements=["cik", "accn", "property_type", "metric_name"],
+                set_={"value": row["value"]},
+            )
+        )
+        self._session.execute(stmt)
+
+    def upsert_many(self, rows: list[dict]) -> int:
+        """
+        Upsert a batch of property fact rows.
+
+        Parameters:
+            rows: List of dicts as returned by
+                  :func:`~reit_dashboard.data.property_parser.property_result_to_rows`.
+
+        Returns:
+            int: Number of rows processed.
+        """
+        for row in rows:
+            self.upsert(row)
+        return len(rows)
+
+    def get_facts(
+        self,
+        cik: str,
+        form: str | None = None,
+        metric_name: str | None = None,
+    ) -> list[PropertyFact]:
+        """
+        Query property facts for a company with optional filters.
+
+        Parameters:
+            cik:         Company CIK.
+            form:        Restrict to a specific form type (e.g. "10-K").
+            metric_name: Restrict to a specific normalised metric key.
+
+        Returns:
+            list[PropertyFact]: Matching rows ordered by period_end.
+        """
+        stmt = (
+            select(PropertyFact)
+            .where(PropertyFact.cik == cik)
+            .order_by(PropertyFact.period_end, PropertyFact.property_type)
+        )
+        if form is not None:
+            stmt = stmt.where(PropertyFact.form == form)
+        if metric_name is not None:
+            stmt = stmt.where(PropertyFact.metric_name == metric_name)
+        return list(self._session.scalars(stmt))
+
+    def get_facts_for_ciks(
+        self,
+        ciks: list[str],
+        metric_name: str | None = None,
+        form: str | None = None,
+    ) -> list[PropertyFact]:
+        """
+        Query property facts for multiple companies.
+
+        Parameters:
+            ciks:        List of CIKs.
+            metric_name: Optional metric filter.
+            form:        Optional form type filter.
+
+        Returns:
+            list[PropertyFact]: Matching rows.
+        """
+        stmt = (
+            select(PropertyFact)
+            .where(PropertyFact.cik.in_(ciks))
+            .order_by(PropertyFact.cik, PropertyFact.period_end)
+        )
+        if metric_name is not None:
+            stmt = stmt.where(PropertyFact.metric_name == metric_name)
+        if form is not None:
+            stmt = stmt.where(PropertyFact.form == form)
+        return list(self._session.scalars(stmt))
+
+    def get_latest_filing_accns(self, ciks: list[str]) -> dict[str, str]:
+        """
+        Return the most recent accession number per CIK that has data.
+
+        Parameters:
+            ciks: List of CIKs.
+
+        Returns:
+            dict: {cik: accn} for the most recent filed record per company.
+        """
+        result: dict[str, str] = {}
+        for cik in ciks:
+            stmt = (
+                select(PropertyFact.accn)
+                .where(PropertyFact.cik == cik)
+                .order_by(PropertyFact.period_end.desc())
+                .limit(1)
+            )
+            row = self._session.scalars(stmt).first()
+            if row is not None:
+                result[cik] = row
+        return result

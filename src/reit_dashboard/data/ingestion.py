@@ -5,14 +5,16 @@ Orchestrates the end-to-end pipeline:
   1. Fetch company metadata from EDGAR.
   2. Fetch XBRL quarterly (10-Q) financial facts for the last 5 years.
   3. Fetch weekly stock prices via Yahoo Finance for the last 5 years.
-  4. Validate and transform via Pydantic models.
-  5. Persist to the database via repository layer.
+  4. Parse Item 2 property tables from 10-K/10-Q filing HTML.
+  5. Validate and transform via Pydantic models.
+  6. Persist to the database via repository layer.
 
 This module owns the business logic; it depends on EdgarClient,
 StockPriceClient, and the repository classes but does not know about
 HTTP or SQL details directly.
 """
 
+import logging
 from datetime import date
 from decimal import Decimal
 
@@ -20,12 +22,19 @@ from sqlalchemy.orm import Session
 
 from reit_dashboard.data.edgar_client import EdgarClient
 from reit_dashboard.data.models import Company, FinancialFact, StockPrice
+from reit_dashboard.data.property_parser import (
+    extract_property_data,
+    property_result_to_rows,
+)
 from reit_dashboard.data.repository import (
     CompanyRepository,
     FinancialFactRepository,
+    PropertyFactRepository,
     StockPriceRepository,
 )
 from reit_dashboard.data.stock_price_client import StockPriceClient
+
+logger = logging.getLogger(__name__)
 
 # CIK → display-name mapping for the PoC REIT universe.
 POC_REITS: dict[str, str] = {
@@ -248,6 +257,137 @@ def ingest_all_stock_prices(
                     "name": name,
                     "ticker": ticker,
                     "prices_upserted": 0,
+                    "error": str(exc),
+                }
+            )
+
+    return results
+
+
+def ingest_property_data(
+    cik: str,
+    ticker: str | None,
+    client: EdgarClient,
+    session: Session,
+    since_date: date | None = None,
+    forms: set[str] | None = None,
+    max_filings: int = 10,
+) -> dict[str, object]:
+    """
+    Ingest Item 2 property table data for one company.
+
+    For each filing in the requested window the method:
+    1. Lists filings from the EDGAR submissions endpoint.
+    2. Fetches the primary HTML document for the filing.
+    3. Parses the Item 2 "Properties" table.
+    4. Persists the extracted rows via :class:`PropertyFactRepository`.
+
+    Parameters:
+        cik:          Company CIK (raw or zero-padded).
+        ticker:       Exchange ticker symbol (for denormalisation).
+        client:       Configured :class:`EdgarClient` instance.
+        session:      Active SQLAlchemy session (not yet committed).
+        since_date:   Earliest filing date to include.
+                      Defaults to 5 years ago.
+        forms:        Form types to fetch.  Defaults to ``{"10-K", "10-Q"}``.
+        max_filings:  Maximum number of filings to process.  Defaults to 10
+                      to limit latency during the PoC.
+
+    Returns:
+        dict: Summary with keys ``filings_processed``, ``rows_upserted``,
+        ``filings_parsed`` (count with at least one property record).
+    """
+    if since_date is None:
+        since_date = _five_years_ago()
+    if forms is None:
+        forms = {"10-K", "10-Q"}
+
+    prop_repo = PropertyFactRepository(session)
+
+    filings = client.list_filings(
+        cik, forms=forms, since_date=since_date, max_filings=max_filings
+    )
+
+    filings_processed = 0
+    filings_parsed = 0
+    rows_upserted = 0
+
+    for filing in filings:
+        accn = filing["accn"]
+        form = filing["form"]
+        period_end = filing.get("reportDate") or filing.get("filingDate", "")
+
+        try:
+            html = client.fetch_filing_html(cik, accn)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch HTML for %s / %s: %s", cik, accn, exc)
+            filings_processed += 1
+            continue
+
+        result = extract_property_data(html, accn, form)
+        filings_processed += 1
+
+        if not result.records:
+            logger.debug("No property table found in %s / %s", cik, accn)
+            continue
+
+        db_rows = property_result_to_rows(result, cik, ticker, period_end)
+        rows_upserted += prop_repo.upsert_many(db_rows)
+        filings_parsed += 1
+
+    return {
+        "filings_processed": filings_processed,
+        "filings_parsed": filings_parsed,
+        "rows_upserted": rows_upserted,
+    }
+
+
+def ingest_all_property_data(
+    client: EdgarClient,
+    session: Session,
+    since_date: date | None = None,
+    max_filings_per_company: int = 10,
+) -> list[dict[str, object]]:
+    """
+    Run property data ingestion for all companies in the PoC universe.
+
+    Commits after each company so a failure on one does not roll back
+    data already persisted for previous companies.
+
+    Parameters:
+        client:                  Configured :class:`EdgarClient` instance.
+        session:                 Active SQLAlchemy session.
+        since_date:              Earliest filing date to include.
+        max_filings_per_company: Cap per company to limit latency.
+
+    Returns:
+        list[dict]: One summary dict per company.
+    """
+    results: list[dict[str, object]] = []
+
+    for cik, name in POC_REITS.items():
+        ticker = POC_TICKERS.get(cik)
+        try:
+            summary = ingest_property_data(
+                cik,
+                ticker,
+                client,
+                session,
+                since_date=since_date,
+                max_filings=max_filings_per_company,
+            )
+            session.commit()
+            results.append({"cik": cik, "name": name, "ticker": ticker, "error": None, **summary})
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            results.append(
+                {
+                    "cik": cik,
+                    "name": name,
+                    "ticker": ticker,
+                    "filings_processed": 0,
+                    "filings_parsed": 0,
+                    "rows_upserted": 0,
                     "error": str(exc),
                 }
             )

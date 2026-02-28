@@ -22,6 +22,7 @@ from reit_dashboard.data.models import Base
 from reit_dashboard.data.repository import (
     CompanyRepository,
     FinancialFactRepository,
+    PropertyFactRepository,
     StockPriceRepository,
 )
 
@@ -190,9 +191,71 @@ def load_stock_prices(
     return df
 
 
-# ---------------------------------------------------------------------------
-# Chart helpers
-# ---------------------------------------------------------------------------
+def load_property_facts(
+    session_factory,
+    ciks: list[str],
+    metric_name: str | None = None,
+    form: str | None = None,
+) -> pd.DataFrame:
+    """
+    Load parsed Item 2 property facts for the selected companies.
+
+    Parameters:
+        session_factory: SQLAlchemy sessionmaker.
+        ciks:            List of CIKs to include.
+        metric_name:     Optional filter on the normalised metric key.
+        form:            Optional form type filter (e.g. "10-K").
+
+    Returns:
+        pd.DataFrame: Columns cik, ticker, company_name, period_end,
+            form, accn, property_type, metric_name, value_numeric.
+            Returns empty DataFrame when no data is available.
+    """
+    if not ciks:
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    with session_factory() as session:
+        prop_repo = PropertyFactRepository(session)
+        company_repo = CompanyRepository(session)
+        name_cache: dict[str, str] = {}
+
+        facts = prop_repo.get_facts_for_ciks(ciks, metric_name=metric_name, form=form)
+        for f in facts:
+            if f.cik not in name_cache:
+                company = company_repo.get_by_cik(f.cik)
+                name_cache[f.cik] = company.name if company else f.cik
+            # Attempt numeric conversion; keep NaN for non-numeric values.
+            try:
+                numeric = float(f.value.strip("%"))
+                if "%" in f.value:
+                    numeric = numeric  # keep as-is; caller decides to /100
+            except (ValueError, AttributeError):
+                numeric = float("nan")
+            rows.append(
+                {
+                    "cik": f.cik,
+                    "ticker": f.ticker,
+                    "company_name": name_cache[f.cik],
+                    "period_end": f.period_end,
+                    "form": f.form,
+                    "accn": f.accn,
+                    "property_type": f.property_type,
+                    "metric_name": f.metric_name,
+                    "value_str": f.value,
+                    "value_numeric": numeric,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce")
+    return df
+
+
+
 
 _CONCEPT_LABELS: dict[str, str] = {
     "Revenues": "Revenue (USD)",
@@ -636,6 +699,134 @@ def main() -> None:
                 hide_index=True,
             )
 
+    # ================================================================== #
+    # Section 3 – Property Portfolio (Item 2 HTML parser)                 #
+    # ================================================================== #
+    st.header("🏗️ Property Portfolio")
+    st.caption(
+        "Data parsed from Item 2 of SEC 10-K/10-Q filings. "
+        "Run `uv run python scripts/ingest_poc.py` to populate."
+    )
 
-if __name__ == "__main__":
+    prop_df_all = load_property_facts(session_factory, selected_ciks)
+
+    if prop_df_all.empty:
+        st.info(
+            "No property data found. Re-run ingestion with Phase 3 "
+            "(HTML parser) to populate this section."
+        )
+    else:
+        # Metric selector based on what's in the DB for these companies.
+        available_metrics = sorted(prop_df_all["metric_name"].dropna().unique())
+        selected_metric = st.selectbox(
+            "Property Metric",
+            options=available_metrics,
+            format_func=lambda m: m.replace("_", " ").title(),
+            key="property_metric",
+        )
+
+        prop_df = prop_df_all[prop_df_all["metric_name"] == selected_metric].copy()
+        prop_df = prop_df.dropna(subset=["value_numeric"])
+
+        if prop_df.empty:
+            st.info(f"No numeric data available for metric: {selected_metric}")
+        else:
+            tab_breakdown, tab_trend, tab_raw = st.tabs(
+                ["📊 Latest Breakdown", "📈 Trend Over Time", "🗂️ Raw Data"]
+            )
+
+            with tab_breakdown:
+                # Use the most recent period per company.
+                latest_period = (
+                    prop_df.groupby("cik")["period_end"].max().reset_index()
+                )
+                latest_df = prop_df.merge(latest_period, on=["cik", "period_end"])
+                # Sum per company + property type for the latest filing.
+                bar_df = (
+                    latest_df.groupby(["company_name", "property_type"])["value_numeric"]
+                    .sum()
+                    .reset_index()
+                )
+                if not bar_df.empty:
+                    chart = (
+                        alt.Chart(bar_df)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("property_type:N", title="Property Type",
+                                    axis=alt.Axis(labelAngle=-45)),
+                            y=alt.Y("value_numeric:Q",
+                                    title=selected_metric.replace("_", " ").title(),
+                                    axis=alt.Axis(format="~s")),
+                            color=alt.Color("company_name:N", title="Company"),
+                            xOffset="company_name:N",
+                            tooltip=[
+                                alt.Tooltip("company_name:N", title="Company"),
+                                alt.Tooltip("property_type:N", title="Property Type"),
+                                alt.Tooltip("value_numeric:Q",
+                                            title=selected_metric.replace("_", " ").title(),
+                                            format=",.2f"),
+                            ],
+                        )
+                        .properties(
+                            title=f"{selected_metric.replace('_', ' ').title()} by Property Type (latest filing)",
+                            height=380,
+                        )
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+
+            with tab_trend:
+                # Aggregate across property types per company per period.
+                trend_df = (
+                    prop_df.groupby(["company_name", "period_end"])["value_numeric"]
+                    .sum()
+                    .reset_index()
+                )
+                if not trend_df.empty:
+                    trend_chart = (
+                        alt.Chart(trend_df)
+                        .mark_line(point=True)
+                        .encode(
+                            x=alt.X("period_end:T", title="Period End",
+                                    axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                            y=alt.Y("value_numeric:Q",
+                                    title=selected_metric.replace("_", " ").title(),
+                                    axis=alt.Axis(format="~s")),
+                            color=alt.Color("company_name:N", title="Company"),
+                            tooltip=[
+                                alt.Tooltip("company_name:N", title="Company"),
+                                alt.Tooltip("period_end:T", title="Period",
+                                            format="%Y-%m-%d"),
+                                alt.Tooltip("value_numeric:Q",
+                                            title=selected_metric.replace("_", " ").title(),
+                                            format=",.2f"),
+                            ],
+                        )
+                        .properties(
+                            title=f"Total {selected_metric.replace('_', ' ').title()} over time",
+                            height=380,
+                        )
+                        .interactive()
+                    )
+                    st.altair_chart(trend_chart, use_container_width=True)
+
+            with tab_raw:
+                st.dataframe(
+                    prop_df.rename(columns={
+                        "cik": "CIK",
+                        "ticker": "Ticker",
+                        "company_name": "Company",
+                        "period_end": "Period End",
+                        "form": "Form",
+                        "property_type": "Property Type",
+                        "metric_name": "Metric",
+                        "value_str": "Value (raw)",
+                        "value_numeric": "Value (numeric)",
+                    })[["Company", "Ticker", "Period End", "Form",
+                        "Property Type", "Metric", "Value (raw)", "Value (numeric)"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
+
     main()

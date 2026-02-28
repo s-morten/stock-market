@@ -248,3 +248,147 @@ class EdgarClient:
                 # Concept not available for this company – skip gracefully.
                 pass
         return results
+
+    # ------------------------------------------------------------------
+    # CIK lookup
+    # ------------------------------------------------------------------
+
+    def get_cik_for_ticker(self, ticker: str) -> str | None:
+        """
+        Resolve a stock ticker to a SEC CIK using the SEC's public
+        company-tickers JSON file.
+
+        The mapping is fetched once per client call (no local cache here;
+        callers may cache the result themselves).
+
+        Parameters:
+            ticker: Exchange ticker symbol, case-insensitive (e.g. "PLD").
+
+        Returns:
+            str: Zero-padded 10-digit CIK, or ``None`` if not found.
+        """
+        url = "https://www.sec.gov/files/company_tickers.json"
+        data = self._get(url)
+        target = ticker.upper()
+        for entry in data.values():
+            if entry.get("ticker", "").upper() == target:
+                cik_int: int = entry["cik_str"]
+                return str(cik_int).zfill(10)
+        return None
+
+    # ------------------------------------------------------------------
+    # Filing index
+    # ------------------------------------------------------------------
+
+    def list_filings(
+        self,
+        cik: str,
+        forms: set[str] | None = None,
+        since_date: date | None = None,
+        max_filings: int | None = None,
+    ) -> list[dict[str, str]]:
+        """
+        List filings for a company from the EDGAR submissions endpoint.
+
+        Returns a list of dicts with keys:
+        ``accn``, ``form``, ``filingDate``, ``reportDate``.
+
+        Filings are returned in reverse-chronological order (newest first).
+
+        Parameters:
+            cik:          Company CIK (raw or zero-padded).
+            forms:        Filing form types to include (e.g. {"10-K", "10-Q"}).
+                          Defaults to both.
+            since_date:   Exclude filings before this date.
+            max_filings:  Cap the number of results.
+
+        Returns:
+            list[dict]: Filing metadata records.
+        """
+        if forms is None:
+            forms = {"10-K", "10-Q"}
+
+        padded = self._pad_cik(cik)
+        url = f"{_EDGAR_BASE}/submissions/CIK{padded}.json"
+        data = self._get(url)
+
+        recent = data.get("filings", {}).get("recent", {})
+        accns = recent.get("accessionNumber", [])
+        form_list = recent.get("form", [])
+        dates = recent.get("filingDate", [])
+        periods = recent.get("reportDate", [])
+
+        results: list[dict[str, str]] = []
+        for accn, form, filing_date, report_date in zip(
+            accns, form_list, dates, periods
+        ):
+            if form not in forms:
+                continue
+            if since_date is not None and filing_date < since_date.isoformat():
+                continue
+            results.append(
+                {
+                    "accn": accn,
+                    "form": form,
+                    "filingDate": filing_date,
+                    "reportDate": report_date,
+                }
+            )
+            if max_filings is not None and len(results) >= max_filings:
+                break
+
+        return results
+
+    def fetch_filing_html(self, cik: str, accn: str) -> str:
+        """
+        Fetch the primary HTML document for a given SEC filing.
+
+        Resolves the filing index page first, then follows the link to
+        the primary ``.htm`` / ``.html`` document.
+
+        Parameters:
+            cik:  Company CIK (raw or zero-padded).
+            accn: Accession number (with or without dashes).
+
+        Returns:
+            str: Raw HTML text of the primary filing document.
+
+        Raises:
+            httpx.HTTPStatusError: On HTTP errors.
+            ValueError: If no primary HTML document is found in the index.
+        """
+        padded = self._pad_cik(cik)
+        # Accession number in the URL uses no dashes.
+        accn_nodash = accn.replace("-", "")
+        index_url = (
+            f"https://www.sec.gov/Archives/edgar/data/"
+            f"{int(padded)}/{accn_nodash}/{accn_nodash}-index.json"
+        )
+        time.sleep(_REQUEST_DELAY_SECONDS)
+        with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
+            resp = client.get(index_url)
+            resp.raise_for_status()
+            index = resp.json()
+
+        # Find the primary document (largest .htm that is not the index).
+        doc_url: str | None = None
+        for item in index.get("documents", []):
+            if item.get("type") in ("10-K", "10-Q", "10-K/A", "10-Q/A"):
+                name: str = item.get("name", "")
+                if name.lower().endswith((".htm", ".html")):
+                    doc_url = (
+                        f"https://www.sec.gov/Archives/edgar/data/"
+                        f"{int(padded)}/{accn_nodash}/{name}"
+                    )
+                    break
+
+        if doc_url is None:
+            raise ValueError(
+                f"No primary HTML document found for accession {accn}"
+            )
+
+        time.sleep(_REQUEST_DELAY_SECONDS)
+        with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
+            resp = client.get(doc_url)
+            resp.raise_for_status()
+            return resp.text

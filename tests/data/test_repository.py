@@ -251,3 +251,116 @@ class TestStockPriceRepository:
         tickers = {r.ticker for r in result}
         assert tickers == {"PLD", "O"}
         assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# PropertyFactRepository tests
+# ---------------------------------------------------------------------------
+
+from reit_dashboard.data.repository import PropertyFactRepository
+
+
+def _property_row(
+    cik: str = "0001045609",
+    accn: str = "0001045609-23-000001",
+    property_type: str = "Industrial",
+    metric_name: str = "num_properties",
+    value: str = "1200",
+    period_end: str = "2022-12-31",
+    form: str = "10-K",
+    ticker: str | None = "PLD",
+) -> dict:
+    return {
+        "cik": cik,
+        "ticker": ticker,
+        "accn": accn,
+        "period_end": period_end,
+        "form": form,
+        "property_type": property_type,
+        "metric_name": metric_name,
+        "value": value,
+    }
+
+
+def _ensure_company(session, cik: str) -> None:
+    """Insert a company row if it does not already exist (satisfies FK)."""
+    repo = CompanyRepository(session)
+    if repo.get_by_cik(cik) is None:
+        repo.upsert(Company(cik=cik, name=f"Company {cik}", sic="6798"))
+    session.flush()
+
+
+class TestPropertyFactRepository:
+    """Tests for PropertyFactRepository."""
+
+    def test_upsert_inserts_new_row(self, db_session):
+        """Upserting a new property row persists it to the database."""
+        _ensure_company(db_session, "0001045609")
+        repo = PropertyFactRepository(db_session)
+        repo.upsert(_property_row())
+        db_session.commit()
+
+        facts = repo.get_facts("0001045609")
+        assert len(facts) == 1
+        assert facts[0].property_type == "Industrial"
+        assert facts[0].value == "1200"
+
+    def test_upsert_updates_existing_value(self, db_session):
+        """Re-upserting with same key updates the value."""
+        _ensure_company(db_session, "0001045609")
+        repo = PropertyFactRepository(db_session)
+        repo.upsert(_property_row(value="1200"))
+        db_session.commit()
+        repo.upsert(_property_row(value="1250"))
+        db_session.commit()
+
+        facts = repo.get_facts("0001045609")
+        assert len(facts) == 1
+        assert facts[0].value == "1250"
+
+    def test_upsert_many_returns_count(self, db_session):
+        """upsert_many returns the number of rows processed."""
+        _ensure_company(db_session, "0001045609")
+        repo = PropertyFactRepository(db_session)
+        rows = [
+            _property_row(property_type="Industrial", metric_name="num_properties"),
+            _property_row(property_type="Office", metric_name="num_properties"),
+        ]
+        count = repo.upsert_many(rows)
+        assert count == 2
+
+    def test_get_facts_filter_by_metric(self, db_session):
+        """get_facts respects metric_name filter."""
+        _ensure_company(db_session, "0001045609")
+        repo = PropertyFactRepository(db_session)
+        repo.upsert(_property_row(metric_name="num_properties"))
+        repo.upsert(_property_row(metric_name="pct_leased", value="97.5"))
+        db_session.commit()
+
+        facts = repo.get_facts("0001045609", metric_name="pct_leased")
+        assert len(facts) == 1
+        assert facts[0].metric_name == "pct_leased"
+
+    def test_get_facts_filter_by_form(self, db_session):
+        """get_facts respects form filter."""
+        _ensure_company(db_session, "0001045609")
+        repo = PropertyFactRepository(db_session)
+        repo.upsert(_property_row(form="10-K", accn="acc-k"))
+        repo.upsert(_property_row(form="10-Q", accn="acc-q"))
+        db_session.commit()
+
+        facts = repo.get_facts("0001045609", form="10-Q")
+        assert all(f.form == "10-Q" for f in facts)
+
+    def test_get_facts_for_ciks(self, db_session):
+        """get_facts_for_ciks returns data for multiple companies."""
+        _ensure_company(db_session, "0001045609")
+        _ensure_company(db_session, "0000726854")
+        repo = PropertyFactRepository(db_session)
+        repo.upsert(_property_row(cik="0001045609"))
+        repo.upsert(_property_row(cik="0000726854", accn="acc-other"))
+        db_session.commit()
+
+        facts = repo.get_facts_for_ciks(["0001045609", "0000726854"])
+        ciks_returned = {f.cik for f in facts}
+        assert ciks_returned == {"0001045609", "0000726854"}

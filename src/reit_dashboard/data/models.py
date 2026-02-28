@@ -1,9 +1,11 @@
 """
 SQLAlchemy ORM models for the REIT Dashboard.
 
-Two models are defined:
+Three models are defined:
 - Company:       static metadata for a REIT (CIK, name, SIC code, etc.)
 - FinancialFact: a single XBRL financial data point for a company/period.
+- StockPrice:    weekly OHLCV price bar for a publicly traded REIT.
+- PropertyFact:  a single property metric parsed from a filing's Item 2.
 
 No Oracle-specific dialect features are used; the same models work with
 SQLite (development) and Oracle (production) by changing DATABASE_URL.
@@ -157,4 +159,54 @@ class StockPrice(Base):
         return (
             f"<StockPrice ticker={self.ticker!r} date={self.date!r}"
             f" close={self.close!r}>"
+        )
+
+
+class PropertyFact(Base):
+    """
+    A single property metric extracted from a REIT filing's Item 2.
+
+    Each row represents one (property_type, metric_name, value) triple
+    from the property table found in a 10-K or 10-Q filing.
+
+    Example row:
+        cik="0001045609", property_type="Industrial", metric_name="num_properties",
+        value="1200", form="10-K", period_end=date(2023, 12, 31)
+
+    Attributes:
+        id:            Surrogate primary key.
+        cik:           FK to Company.
+        ticker:        Ticker symbol (denormalised for convenience).
+        accn:          SEC accession number of the source filing.
+        period_end:    Reporting period end date (from filing reportDate).
+        form:          Filing form type (e.g. "10-K").
+        property_type: Row label from the table (e.g. "Office").
+        metric_name:   Normalised metric key (e.g. "num_properties").
+        value:         Raw string value as parsed (may contain "%" etc.).
+    """
+
+    __tablename__ = "property_facts"
+    __table_args__ = (
+        UniqueConstraint(
+            "cik", "accn", "property_type", "metric_name",
+            name="uq_property_fact",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    cik: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.cik"), nullable=False, index=True
+    )
+    ticker: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    accn: Mapped[str] = mapped_column(String(40), nullable=False)
+    period_end: Mapped[date | None] = mapped_column(Date, nullable=True)
+    form: Mapped[str] = mapped_column(String(20), nullable=False)
+    property_type: Mapped[str] = mapped_column(String(256), nullable=False)
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    value: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    def __repr__(self) -> str:
+        return (
+            f"<PropertyFact cik={self.cik!r} period_end={self.period_end!r}"
+            f" property_type={self.property_type!r} {self.metric_name}={self.value!r}>"
         )
