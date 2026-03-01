@@ -262,6 +262,11 @@ _CONCEPT_LABELS: dict[str, str] = {
     "NetIncomeLoss": "Net Income / Loss (USD)",
     "Assets": "Total Assets (USD)",
     "Liabilities": "Total Liabilities (USD)",
+    "LongTermDebt": "Long-Term Debt (USD)",
+    "LongTermDebtNoncurrent": "Long-Term Debt Non-current (USD)",
+    "ShortTermBorrowings": "Short-Term Borrowings (USD)",
+    "InterestExpense": "Interest Expense (USD)",
+    "InterestAndDebtExpense": "Interest & Debt Expense (USD)",
 }
 
 
@@ -542,7 +547,11 @@ def main() -> None:
 
     concept = st.sidebar.selectbox(
         "Financial Concept",
-        options=["Revenues", "NetIncomeLoss", "Assets", "Liabilities"],
+        options=[
+            "Revenues", "NetIncomeLoss", "Assets", "Liabilities",
+            "LongTermDebt", "LongTermDebtNoncurrent",
+            "ShortTermBorrowings", "InterestExpense", "InterestAndDebtExpense",
+        ],
         format_func=lambda c: _CONCEPT_LABELS.get(c, c),
     )
 
@@ -795,7 +804,164 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+    st.divider()
 
+    # ================================================================== #
+    # Section 4 – Debt & Interest                                         #
+    # ================================================================== #
+    st.header("🏦 Debt & Interest")
+    st.caption(
+        "Long-term debt, short-term borrowings, and interest expense from "
+        "SEC EDGAR XBRL (10-Q quarterly filings)."
+    )
+
+    # Load debt and interest facts for selected companies/period.
+    _DEBT_CONCEPTS = [
+        "LongTermDebt",
+        "LongTermDebtNoncurrent",
+        "ShortTermBorrowings",
+        "InterestExpense",
+        "InterestAndDebtExpense",
+    ]
+
+    debt_frames: list[pd.DataFrame] = []
+    for _concept in _DEBT_CONCEPTS:
+        _df = load_facts(
+            session_factory, selected_ciks, _concept, "10-Q", start_date, end_date
+        )
+        if not _df.empty:
+            debt_frames.append(_df)
+
+    debt_df = pd.concat(debt_frames, ignore_index=True) if debt_frames else pd.DataFrame()
+
+    if debt_df.empty:
+        st.info(
+            "No debt/interest data found. Re-run ingestion to populate. "
+            "New debt concepts (LongTermDebt, InterestExpense, etc.) are "
+            "fetched automatically on the next ingestion run."
+        )
+    else:
+        # Split into debt vs interest for separate charts.
+        _DEBT_ONLY = {"LongTermDebt", "LongTermDebtNoncurrent", "ShortTermBorrowings"}
+        _INT_ONLY = {"InterestExpense", "InterestAndDebtExpense"}
+
+        debt_only_df = debt_df[debt_df["concept"].isin(_DEBT_ONLY)]
+        int_only_df = debt_df[debt_df["concept"].isin(_INT_ONLY)]
+
+        tab_debt, tab_interest, tab_ratio = st.tabs(
+            ["📉 Debt Over Time", "💸 Interest Expense", "⚖️ Debt-to-Assets"]
+        )
+
+        with tab_debt:
+            if debt_only_df.empty:
+                st.info("No debt data available.")
+            else:
+                debt_chart = (
+                    alt.Chart(debt_only_df)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("period_end:T", title="Period End",
+                                axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                        y=alt.Y("value:Q", title="USD",
+                                axis=alt.Axis(format="~s"), scale=alt.Scale(zero=True)),
+                        color=alt.Color("company_name:N", title="Company"),
+                        strokeDash=alt.StrokeDash("concept:N", title="Concept"),
+                        tooltip=[
+                            alt.Tooltip("company_name:N", title="Company"),
+                            alt.Tooltip("concept:N", title="Concept"),
+                            alt.Tooltip("period_end:T", title="Period", format="%Y-%m-%d"),
+                            alt.Tooltip("value:Q", title="USD", format="$,.0f"),
+                        ],
+                    )
+                    .properties(title="Long-Term & Short-Term Debt", height=400)
+                    .interactive()
+                )
+                st.altair_chart(debt_chart, use_container_width=True)
+
+        with tab_interest:
+            if int_only_df.empty:
+                st.info("No interest expense data available.")
+            else:
+                int_chart = (
+                    alt.Chart(int_only_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("period_end:T", title="Period End",
+                                axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                        y=alt.Y("value:Q", title="USD",
+                                axis=alt.Axis(format="~s")),
+                        color=alt.Color("company_name:N", title="Company"),
+                        xOffset="company_name:N",
+                        tooltip=[
+                            alt.Tooltip("company_name:N", title="Company"),
+                            alt.Tooltip("concept:N", title="Concept"),
+                            alt.Tooltip("period_end:T", title="Period", format="%Y-%m-%d"),
+                            alt.Tooltip("value:Q", title="USD", format="$,.0f"),
+                        ],
+                    )
+                    .properties(title="Interest & Debt Expense per Quarter", height=400)
+                    .interactive()
+                )
+                st.altair_chart(int_chart, use_container_width=True)
+
+        with tab_ratio:
+            # Debt-to-Assets = LongTermDebt / Assets (per company, per period).
+            assets_df = load_facts(
+                session_factory, selected_ciks, "Assets", "10-Q", start_date, end_date
+            )
+            ltd_df = debt_only_df[debt_only_df["concept"] == "LongTermDebt"]
+
+            if assets_df.empty or ltd_df.empty:
+                st.info("Need both Assets and LongTermDebt data to compute ratio.")
+            else:
+                merged = pd.merge(
+                    ltd_df[["cik", "company_name", "period_end", "value"]].rename(
+                        columns={"value": "ltd"}
+                    ),
+                    assets_df[["cik", "period_end", "value"]].rename(
+                        columns={"value": "assets"}
+                    ),
+                    on=["cik", "period_end"],
+                    how="inner",
+                )
+                merged = merged[merged["assets"] > 0].copy()
+                merged["ratio"] = merged["ltd"] / merged["assets"]
+
+                ratio_chart = (
+                    alt.Chart(merged)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("period_end:T", title="Period End",
+                                axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                        y=alt.Y("ratio:Q", title="LTD / Assets",
+                                axis=alt.Axis(format=".0%"),
+                                scale=alt.Scale(zero=True)),
+                        color=alt.Color("company_name:N", title="Company"),
+                        tooltip=[
+                            alt.Tooltip("company_name:N", title="Company"),
+                            alt.Tooltip("period_end:T", title="Period", format="%Y-%m-%d"),
+                            alt.Tooltip("ratio:Q", title="LTD/Assets", format=".1%"),
+                        ],
+                    )
+                    .properties(title="Debt-to-Assets Ratio (LTD / Total Assets)", height=400)
+                    .interactive()
+                )
+                st.altair_chart(ratio_chart, use_container_width=True)
+
+        with st.expander("Raw Debt & Interest Data", expanded=False):
+            st.dataframe(
+                debt_df.rename(columns={
+                    "company_name": "Company",
+                    "concept": "Concept",
+                    "period_end": "Period End",
+                    "quarter_label": "Quarter",
+                    "value": "Value (USD)",
+                    "unit": "Unit",
+                })[["Company", "Concept", "Quarter", "Period End",
+                    "Value (USD)", "Unit"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
     main()

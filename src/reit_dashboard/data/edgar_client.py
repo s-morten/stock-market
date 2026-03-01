@@ -20,7 +20,19 @@ from pydantic import BaseModel, Field
 _EDGAR_BASE = "https://data.sec.gov"
 
 # GAAP concepts fetched for every company in the PoC (all denominated in USD).
-POC_CONCEPTS = ["Revenues", "NetIncomeLoss", "Assets", "Liabilities"]
+POC_CONCEPTS = [
+    # Core income statement / balance sheet
+    "Revenues",
+    "NetIncomeLoss",
+    "Assets",
+    "Liabilities",
+    # Debt & interest
+    "LongTermDebt",
+    "LongTermDebtNoncurrent",
+    "ShortTermBorrowings",
+    "InterestExpense",
+    "InterestAndDebtExpense",
+]
 
 # Minimum seconds between outgoing HTTP requests.
 # The SEC enforces a limit of 10 requests/second; 0.11 s gives a safe margin.

@@ -36,6 +36,10 @@ DEFAULT_MODEL = "gemini-2.0-flash"
 # Seconds to wait between consecutive Gemini requests to respect 15 RPM.
 _GEMINI_REQUEST_DELAY = 4.5
 
+# Retry settings for 429 responses.
+_MAX_RETRIES = 5
+_RETRY_BASE_DELAY = 30.0  # seconds; doubles on each retry
+
 # Prompt template; {tables_text} is substituted before the API call.
 _PROMPT_TEMPLATE = """\
 You are analyzing tables extracted from Item 2 "Properties" of a REIT \
@@ -81,6 +85,51 @@ class GeminiPropertyExtractor:
         self._model = model
         self._timeout = timeout
 
+    def _post_with_retry(self, url: str, payload: dict) -> httpx.Response:
+        """
+        POST *payload* to *url* with exponential back-off on HTTP 429.
+
+        Retries up to :data:`_MAX_RETRIES` times. The wait time starts at
+        :data:`_RETRY_BASE_DELAY` seconds and doubles on each attempt.
+
+        Parameters:
+            url:     Full request URL (API key already embedded).
+            payload: JSON-serialisable request body.
+
+        Returns:
+            The successful :class:`httpx.Response`.
+
+        Raises:
+            httpx.HTTPStatusError: If all retries are exhausted or a non-429
+                error is received.
+        """
+        delay = _RETRY_BASE_DELAY
+        for attempt in range(1, _MAX_RETRIES + 2):  # +1 for the initial try
+            with httpx.Client(timeout=self._timeout) as client:
+                response = client.post(url, json=payload)
+
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response
+
+            if attempt > _MAX_RETRIES:
+                # Final attempt still hit rate limit – give up.
+                response.raise_for_status()
+
+            print(
+                f"[GEMINI] 429 Too Many Requests on attempt {attempt}/{_MAX_RETRIES}. "
+                f"Waiting {delay:.0f}s before retry…"
+            )
+            logger.warning(
+                "[GEMINI] 429 on attempt %d/%d – sleeping %.0fs.",
+                attempt, _MAX_RETRIES, delay,
+            )
+            time.sleep(delay)
+            delay *= 2  # exponential back-off
+
+        # Unreachable, but satisfies type checkers.
+        raise RuntimeError("Retry loop exited unexpectedly.")
+
     def extract_property_count(
         self,
         tables_text: str,
@@ -105,12 +154,52 @@ class GeminiPropertyExtractor:
             ValueError: If the response body cannot be parsed as JSON.
         """
         if not tables_text.strip():
+            logger.info("Gemini: empty tables_text – skipping API call.")
             return {"total_properties": None, "notes": "No table text provided."}
 
-        time.sleep(_GEMINI_REQUEST_DELAY)
+        truncated_text = tables_text[:12_000]
+        prompt = _PROMPT_TEMPLATE.format(tables_text=truncated_text)
 
-        prompt = _PROMPT_TEMPLATE.format(tables_text=tables_text[:12_000])
+        # ------------------------------------------------------------------ #
+        # Verbose debug output – intentionally very detailed so the user can  #
+        # inspect exactly what is sent to the model.                          #
+        # ------------------------------------------------------------------ #
+        _SEPARATOR = "=" * 72
+        logger.debug(
+            "\n%s\n[GEMINI] EXTRACTED TABLES TEXT (%d chars, truncated to %d)\n%s\n%s\n%s",
+            _SEPARATOR,
+            len(tables_text),
+            len(truncated_text),
+            _SEPARATOR,
+            truncated_text,
+            _SEPARATOR,
+        )
+        logger.debug(
+            "\n%s\n[GEMINI] FULL PROMPT SENT TO %s (%d chars)\n%s\n%s\n%s",
+            _SEPARATOR,
+            self._model,
+            len(prompt),
+            _SEPARATOR,
+            prompt,
+            _SEPARATOR,
+        )
+
+        # Also print to stdout so output is visible even without a DEBUG
+        # handler configured on the logger.
+        print(f"\n{'=' * 72}")
+        print(f"[GEMINI] EXTRACTED TABLES TEXT ({len(tables_text)} chars, truncated to {len(truncated_text)})")
+        print("=" * 72)
+        print(truncated_text)
+        print("=" * 72)
+        print(f"\n[GEMINI] FULL PROMPT SENT TO {self._model} ({len(prompt)} chars)")
+        print("=" * 72)
+        print(prompt)
+        print("=" * 72 + "\n")
+
         url = _GEMINI_URL.format(model=self._model, api_key=self._api_key)
+
+        logger.debug("[GEMINI] Sleeping %.1fs before API call (rate-limit guard).", _GEMINI_REQUEST_DELAY)
+        time.sleep(_GEMINI_REQUEST_DELAY)
 
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -120,9 +209,10 @@ class GeminiPropertyExtractor:
             },
         }
 
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.post(url, json=payload)
-            response.raise_for_status()
+        logger.debug("[GEMINI] POST %s", url.split("?")[0])  # hide API key in log
+
+        # Retry with exponential back-off on 429 Too Many Requests.
+        response = self._post_with_retry(url, payload)
 
         data = response.json()
         raw_text = (
@@ -132,6 +222,14 @@ class GeminiPropertyExtractor:
             .get("text", "{}")
         )
 
+        logger.debug(
+            "\n%s\n[GEMINI] RAW RESPONSE TEXT\n%s\n%s\n%s",
+            _SEPARATOR, _SEPARATOR, raw_text, _SEPARATOR,
+        )
+        print(f"\n[GEMINI] RAW RESPONSE\n{'=' * 72}")
+        print(raw_text)
+        print("=" * 72 + "\n")
+
         # Strip accidental markdown fences that some models add.
         raw_text = raw_text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
 
@@ -139,6 +237,7 @@ class GeminiPropertyExtractor:
             result: dict[str, Any] = json.loads(raw_text)
         except json.JSONDecodeError as exc:
             logger.warning("Gemini returned non-JSON: %r – %s", raw_text[:200], exc)
+            print(f"[GEMINI] WARNING: non-JSON response: {raw_text[:200]!r}")
             return {"total_properties": None, "notes": f"Parse error: {exc}"}
 
         # Normalise total_properties to int | None.
@@ -148,5 +247,8 @@ class GeminiPropertyExtractor:
                 result["total_properties"] = int(raw_count)
             except (TypeError, ValueError):
                 result["total_properties"] = None
+
+        logger.info("[GEMINI] Result: total_properties=%s  notes=%r", result.get("total_properties"), result.get("notes"))
+        print(f"[GEMINI] Result → total_properties={result.get('total_properties')}  notes={result.get('notes')!r}\n")
 
         return result

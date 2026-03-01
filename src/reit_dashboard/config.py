@@ -41,6 +41,26 @@ def get_gemini_api_key() -> str | None:
     return os.getenv("GEMINI_API_KEY") or None
 
 
+def is_gemini_enabled() -> bool:
+    """
+    Return whether Gemini-based property extraction is enabled.
+
+    Gemini is enabled only when *both* conditions are true:
+    1. ``GEMINI_API_KEY`` is set in the environment.
+    2. ``GEMINI_ENABLED`` is not explicitly set to ``0`` or ``false``.
+
+    Set ``GEMINI_ENABLED=0`` in ``.env`` to temporarily disable Gemini
+    without removing the API key (e.g. when the service is down).
+
+    Returns:
+        bool: ``True`` if Gemini should be used, ``False`` otherwise.
+    """
+    if not get_gemini_api_key():
+        return False
+    flag = os.getenv("GEMINI_ENABLED", "1").strip().lower()
+    return flag not in {"0", "false", "no", "off"}
+
+
 def get_edgar_user_agent() -> str:
     """
     Return the User-Agent string required by the SEC EDGAR API.

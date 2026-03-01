@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
-from reit_dashboard.config import get_database_url, get_edgar_user_agent, get_gemini_api_key
+from reit_dashboard.config import get_database_url, get_edgar_user_agent, is_gemini_enabled
 from reit_dashboard.data.edgar_client import EdgarClient
 from reit_dashboard.data.ingestion import (
     ingest_all_poc_reits,
@@ -118,15 +118,15 @@ def main() -> None:
     # 3. EDGAR HTML: Item 2 property tables + Gemini property counts      #
     # ------------------------------------------------------------------ #
     gemini_extractor = None
-    gemini_key = get_gemini_api_key()
-    if gemini_key:
+    if is_gemini_enabled():
         from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
-        gemini_extractor = GeminiPropertyExtractor(api_key=gemini_key)
+        from reit_dashboard.config import get_gemini_api_key
+        gemini_extractor = GeminiPropertyExtractor(api_key=get_gemini_api_key())
         print("\n=== Property data ingestion (Item 2 HTML + Gemini) ===\n")
     else:
         print(
-            "\n=== Property data ingestion (Item 2 HTML, no Gemini key set) ===\n"
-            "  Set GEMINI_API_KEY in .env to enable Gemini property count extraction.\n"
+            "\n=== Property data ingestion (Item 2 HTML, Gemini disabled) ===\n"
+            "  Set GEMINI_API_KEY and GEMINI_ENABLED=1 in .env to enable Gemini.\n"
         )
 
     with SessionFactory() as session:
