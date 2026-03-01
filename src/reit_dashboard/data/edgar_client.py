@@ -7,8 +7,21 @@ Uses the public SEC EDGAR REST API:
 
 The SEC requires a descriptive User-Agent header on every request.
 All network calls use httpx for easy async upgrade and test mocking.
+
+EDGAR API response logging
+--------------------------
+Every API response (URL, HTTP status, full JSON payload) is written to a
+rotating log file so that all data received from the SEC can be inspected
+offline.  The log path defaults to ``logs/edgar_api.log`` relative to the
+working directory and can be overridden via the ``EDGAR_LOG_FILE``
+environment variable.  Set ``EDGAR_LOG_ENABLED=0`` to disable file logging
+without changing any code.
 """
 
+import json
+import logging
+import logging.handlers
+import os
 import time
 from datetime import date
 from typing import Any
@@ -37,6 +50,64 @@ POC_CONCEPTS = [
 # Minimum seconds between outgoing HTTP requests.
 # The SEC enforces a limit of 10 requests/second; 0.11 s gives a safe margin.
 _REQUEST_DELAY_SECONDS = 0.11
+
+# ---------------------------------------------------------------------------
+# File logger for EDGAR API responses
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+def _build_edgar_file_logger() -> logging.Logger | None:
+    """
+    Create and return a dedicated file logger for raw EDGAR API responses.
+
+    The logger writes one JSON record per line to a rotating log file so
+    every response from the SEC API can be audited offline.
+
+    Configuration via environment variables
+    ----------------------------------------
+    ``EDGAR_LOG_FILE``
+        Path to the log file.  Defaults to ``logs/edgar_api.log`` relative
+        to the current working directory.
+    ``EDGAR_LOG_ENABLED``
+        Set to ``0`` / ``false`` / ``no`` to disable file logging entirely
+        (e.g. during unit tests).  Enabled by default.
+
+    Returns:
+        logging.Logger configured with a RotatingFileHandler, or ``None``
+        if logging is disabled.
+    """
+    enabled = os.getenv("EDGAR_LOG_ENABLED", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return None
+
+    log_path = os.getenv("EDGAR_LOG_FILE", "logs/edgar_api.log")
+    log_file = os.path.abspath(log_path)
+
+    # Create parent directory if needed.
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    file_logger = logging.getLogger("edgar_api_responses")
+    file_logger.setLevel(logging.DEBUG)
+    file_logger.propagate = False  # Don't pollute the root logger.
+
+    # Only add the handler once (guard against repeated module imports).
+    if not file_logger.handlers:
+        handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=50 * 1024 * 1024,  # 50 MB per file
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        file_logger.addHandler(handler)
+
+    return file_logger
+
+
+# Module-level logger instance (created once on import).
+_edgar_file_logger: logging.Logger | None = _build_edgar_file_logger()
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +169,37 @@ class EdgarClient:
         self._headers = {"User-Agent": user_agent}
         self._timeout = timeout
 
+    def _log_response(self, url: str, status_code: int, body: Any) -> None:
+        """
+        Write one JSON log record for an EDGAR API response.
+
+        Each record contains:
+        - ``timestamp`` – ISO-8601 UTC time of the response.
+        - ``url``        – Full request URL (no credentials embedded).
+        - ``status``     – HTTP status code.
+        - ``body``       – Full parsed JSON response body.
+
+        Parameters:
+            url:         Request URL.
+            status_code: HTTP response status code.
+            body:        Parsed JSON body (dict or list).
+        """
+        if _edgar_file_logger is None:
+            return
+
+        from datetime import datetime, timezone
+
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "url": url,
+            "status": status_code,
+            "body": body,
+        }
+        try:
+            _edgar_file_logger.debug(json.dumps(record, default=str))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write EDGAR log record: %s", exc)
+
     def _get(self, url: str) -> dict[str, Any]:
         """
         Perform a GET request and return the parsed JSON body.
@@ -106,6 +208,9 @@ class EdgarClient:
         every request so the caller never exceeds the SEC rate limit of
         10 requests per second, even when many concepts are fetched in a
         tight loop.
+
+        Every response (URL, status code, full JSON body) is written to
+        the rotating EDGAR API log file via :meth:`_log_response`.
 
         Parameters:
             url: Absolute URL to request.
@@ -119,8 +224,16 @@ class EdgarClient:
         time.sleep(_REQUEST_DELAY_SECONDS)
         with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
             response = client.get(url)
+            # Log the raw response before raising so error responses are
+            # captured too.
+            try:
+                body = response.json()
+            except Exception:  # noqa: BLE001
+                body = response.text
+            self._log_response(url, response.status_code, body)
+            logger.debug("EDGAR GET %s → %d", url, response.status_code)
             response.raise_for_status()
-            return response.json()
+            return body  # type: ignore[return-value]
 
     @staticmethod
     def _pad_cik(cik: str) -> str:
@@ -410,13 +523,18 @@ class EdgarClient:
             time.sleep(_REQUEST_DELAY_SECONDS)
             with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
                 resp = client.get(index_url)
+                try:
+                    index = resp.json()
+                except Exception:  # noqa: BLE001
+                    index = resp.text
+                self._log_response(index_url, resp.status_code, index)
+                logger.debug("EDGAR GET %s → %d", index_url, resp.status_code)
                 resp.raise_for_status()
-                index = resp.json()
 
             # Find the primary document (.htm whose type matches the form).
             _FORM_TYPES = {"10-K", "10-Q", "10-K/A", "10-Q/A"}
             primary_doc = None
-            for item in index.get("documents", []):
+            for item in (index if isinstance(index, dict) else {}).get("documents", []):
                 if item.get("type") in _FORM_TYPES:
                     name: str = item.get("name", "")
                     if name.lower().endswith((".htm", ".html")):
@@ -432,5 +550,14 @@ class EdgarClient:
         time.sleep(_REQUEST_DELAY_SECONDS)
         with httpx.Client(headers=self._headers, timeout=self._timeout) as client:
             resp = client.get(doc_url)
+            # Log metadata only for HTML responses (body is too large to store).
+            self._log_response(
+                doc_url,
+                resp.status_code,
+                {"content_type": resp.headers.get("content-type", ""),
+                 "content_length_bytes": len(resp.content),
+                 "note": "HTML body omitted from log (use raw filing URL above)"},
+            )
+            logger.debug("EDGAR GET %s → %d (%d bytes)", doc_url, resp.status_code, len(resp.content))
             resp.raise_for_status()
             return resp.text

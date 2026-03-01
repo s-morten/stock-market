@@ -31,3 +31,6 @@ htmlcov/
 # Property extraction output files
 property_extract.json
 property_extract.txt
+
+# EDGAR API response logs
+logs/
