@@ -611,6 +611,15 @@ def main() -> None:
         [f for f in _debt_frames if not f.empty], ignore_index=True
     ) if any(not f.empty for f in _debt_frames) else pd.DataFrame()
 
+    # --- EPS facts (quarterly, for P/E calculation) ---
+    _eps_frames = [
+        load_facts(session_factory, selected_ciks, c, "10-Q", start_date, end_date)
+        for c in ["EarningsPerShareBasic", "EarningsPerShareDiluted"]
+    ]
+    eps_df = pd.concat(
+        [f for f in _eps_frames if not f.empty], ignore_index=True
+    ) if any(not f.empty for f in _eps_frames) else pd.DataFrame()
+
     # ================================================================== #
     # Section 1 – Financial Fundamentals                                  #
     # ================================================================== #
@@ -957,6 +966,140 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+
+    st.divider()
+
+    # ================================================================== #
+    # Section 5 – Price-to-Earnings (P/E) Ratio                          #
+    # ================================================================== #
+    st.header("📐 Price-to-Earnings (P/E) Ratio")
+    st.caption(
+        "Trailing-12-month P/E = stock price ÷ TTM EPS (sum of last 4 quarterly "
+        "EarningsPerShareBasic values).  Re-run ingestion to fetch EPS data."
+    )
+
+    if eps_df.empty or price_df.empty:
+        st.info(
+            "P/E ratio requires both stock price data and EPS data. "
+            "Re-run `uv run python scripts/ingest_poc.py` to populate EPS "
+            "(EarningsPerShareBasic was added to the ingestion pipeline)."
+        )
+    else:
+        # Use EarningsPerShareBasic; fall back to Diluted if Basic is absent.
+        eps_basic = eps_df[eps_df["concept"] == "EarningsPerShareBasic"]
+        if eps_basic.empty:
+            eps_basic = eps_df[eps_df["concept"] == "EarningsPerShareDiluted"]
+
+        # Build TTM EPS time series per company.
+        # For each company, sort quarters and compute rolling 4-quarter sum.
+        pe_rows: list[dict] = []
+
+        # Build a cik→ticker mapping from companies_df.
+        cik_ticker = (
+            companies_df[companies_df["ticker"].notna()]
+            .set_index("cik")["ticker"]
+            .to_dict()
+        )
+
+        for cik, grp in eps_basic.groupby("cik"):
+            ticker = cik_ticker.get(cik)
+            if not ticker:
+                continue
+
+            # Sort quarters ascending and compute TTM EPS (rolling 4-sum).
+            grp = grp.sort_values("period_end").copy()
+            grp["ttm_eps"] = grp["value"].rolling(window=4, min_periods=4).sum()
+            grp = grp.dropna(subset=["ttm_eps"])
+
+            # Get stock prices for this ticker.
+            ticker_prices = price_df[price_df["ticker"] == ticker].sort_values("date")
+            if ticker_prices.empty:
+                continue
+
+            # For each weekly price, look up the most recent TTM EPS ≤ that date.
+            eps_dates = grp["period_end"].values
+            eps_ttm = grp["ttm_eps"].values
+            company_name = grp["company_name"].iloc[0]
+
+            for _, price_row in ticker_prices.iterrows():
+                price_date = price_row["date"]
+                # Find the last EPS period_end that is <= price_date.
+                mask = eps_dates <= price_date.to_datetime64()
+                if not mask.any():
+                    continue
+                ttm = float(eps_ttm[mask][-1])
+                if ttm <= 0:
+                    # Negative / zero EPS → P/E is not meaningful.
+                    continue
+                pe_rows.append({
+                    "ticker": ticker,
+                    "company_name": company_name,
+                    "date": price_date,
+                    "close": price_row["close"],
+                    "ttm_eps": ttm,
+                    "pe_ratio": price_row["close"] / ttm,
+                })
+
+        if not pe_rows:
+            st.info(
+                "Could not compute P/E ratios. This usually means EPS data "
+                "has not been ingested yet — re-run ingestion with the updated "
+                "pipeline to fetch EarningsPerShareBasic."
+            )
+        else:
+            pe_chart_df = pd.DataFrame(pe_rows)
+            pe_chart_df["date"] = pd.to_datetime(pe_chart_df["date"])
+
+            # Clip extreme outliers (P/E > 200 distorts the chart).
+            pe_chart_df = pe_chart_df[pe_chart_df["pe_ratio"] <= 200]
+
+            pe_chart = (
+                alt.Chart(pe_chart_df)
+                .mark_line()
+                .encode(
+                    x=alt.X("date:T", title="Date",
+                            axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                    y=alt.Y("pe_ratio:Q", title="P/E Ratio",
+                            scale=alt.Scale(zero=False)),
+                    color=alt.Color("company_name:N", title="Company"),
+                    tooltip=[
+                        alt.Tooltip("company_name:N", title="Company"),
+                        alt.Tooltip("ticker:N", title="Ticker"),
+                        alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                        alt.Tooltip("pe_ratio:Q", title="P/E Ratio", format=".1f"),
+                        alt.Tooltip("close:Q", title="Price", format="$.2f"),
+                        alt.Tooltip("ttm_eps:Q", title="TTM EPS", format="$.4f"),
+                    ],
+                )
+                .properties(
+                    title="Trailing-12-Month Price-to-Earnings Ratio",
+                    height=420,
+                )
+                .interactive()
+            )
+            st.altair_chart(pe_chart, use_container_width=True)
+
+            # Latest P/E snapshot table.
+            latest_pe = (
+                pe_chart_df.sort_values("date")
+                .groupby("company_name")
+                .last()
+                .reset_index()[["company_name", "ticker", "date", "close",
+                                "ttm_eps", "pe_ratio"]]
+                .rename(columns={
+                    "company_name": "Company",
+                    "ticker": "Ticker",
+                    "date": "Latest Date",
+                    "close": "Price",
+                    "ttm_eps": "TTM EPS",
+                    "pe_ratio": "P/E Ratio",
+                })
+                .sort_values("P/E Ratio")
+            )
+            latest_pe["Price"] = latest_pe["Price"].map("${:,.2f}".format)
+            latest_pe["TTM EPS"] = latest_pe["TTM EPS"].map("${:,.4f}".format)
+            latest_pe["P/E Ratio"] = latest_pe["P/E Ratio"].map("{:.1f}x".format)
+            st.dataframe(latest_pe, use_container_width=True, hide_index=True)
 
 
 main()

@@ -45,7 +45,18 @@ POC_CONCEPTS = [
     "ShortTermBorrowings",
     "InterestExpense",
     "InterestAndDebtExpense",
+    # Earnings per share (unit varies: "USD/shares" – use auto-detect)
+    "EarningsPerShareBasic",
+    "EarningsPerShareDiluted",
 ]
+
+# Per-concept unit override for fetch_all_poc_facts.
+# Concepts absent from this dict default to "USD".
+# None triggers automatic unit selection (largest entry count).
+POC_CONCEPT_UNITS: dict[str, str | None] = {
+    "EarningsPerShareBasic": None,
+    "EarningsPerShareDiluted": None,
+}
 
 # Minimum seconds between outgoing HTTP requests.
 # The SEC enforces a limit of 10 requests/second; 0.11 s gives a safe margin.
@@ -376,6 +387,7 @@ class EdgarClient:
                     self.fetch_concept_facts(
                         cik,
                         concept,
+                        unit=POC_CONCEPT_UNITS.get(concept, "USD"),
                         since_date=since_date,
                         forms=forms,
                     )
