@@ -547,11 +547,7 @@ def main() -> None:
 
     concept = st.sidebar.selectbox(
         "Financial Concept",
-        options=[
-            "Revenues", "NetIncomeLoss", "Assets", "Liabilities",
-            "LongTermDebt", "LongTermDebtNoncurrent",
-            "ShortTermBorrowings", "InterestExpense", "InterestAndDebtExpense",
-        ],
+        options=["Revenues", "Assets", "Liabilities"],
         format_func=lambda c: _CONCEPT_LABELS.get(c, c),
     )
 
@@ -598,6 +594,22 @@ def main() -> None:
     price_df = load_stock_prices(
         session_factory, selected_tickers, start_date, end_date
     )
+
+    # --- Debt & Interest facts (loaded once for Section 4) ---
+    _DEBT_CONCEPTS = [
+        "LongTermDebt",
+        "LongTermDebtNoncurrent",
+        "ShortTermBorrowings",
+        "InterestExpense",
+        "InterestAndDebtExpense",
+    ]
+    _debt_frames = [
+        load_facts(session_factory, selected_ciks, c, "10-Q", start_date, end_date)
+        for c in _DEBT_CONCEPTS
+    ]
+    debt_df = pd.concat(
+        [f for f in _debt_frames if not f.empty], ignore_index=True
+    ) if any(not f.empty for f in _debt_frames) else pd.DataFrame()
 
     # ================================================================== #
     # Section 1 – Financial Fundamentals                                  #
@@ -815,25 +827,6 @@ def main() -> None:
         "SEC EDGAR XBRL (10-Q quarterly filings)."
     )
 
-    # Load debt and interest facts for selected companies/period.
-    _DEBT_CONCEPTS = [
-        "LongTermDebt",
-        "LongTermDebtNoncurrent",
-        "ShortTermBorrowings",
-        "InterestExpense",
-        "InterestAndDebtExpense",
-    ]
-
-    debt_frames: list[pd.DataFrame] = []
-    for _concept in _DEBT_CONCEPTS:
-        _df = load_facts(
-            session_factory, selected_ciks, _concept, "10-Q", start_date, end_date
-        )
-        if not _df.empty:
-            debt_frames.append(_df)
-
-    debt_df = pd.concat(debt_frames, ignore_index=True) if debt_frames else pd.DataFrame()
-
     if debt_df.empty:
         st.info(
             "No debt/interest data found. Re-run ingestion to populate. "
@@ -906,8 +899,10 @@ def main() -> None:
 
         with tab_ratio:
             # Debt-to-Assets = LongTermDebt / Assets (per company, per period).
-            assets_df = load_facts(
-                session_factory, selected_ciks, "Assets", "10-Q", start_date, end_date
+            # Reuse facts_df if Assets is already selected, else load separately.
+            assets_df = (
+                facts_df if concept == "Assets"
+                else load_facts(session_factory, selected_ciks, "Assets", "10-Q", start_date, end_date)
             )
             ltd_df = debt_only_df[debt_only_df["concept"] == "LongTermDebt"]
 
@@ -964,4 +959,4 @@ def main() -> None:
             )
 
 
-    main()
+main()
