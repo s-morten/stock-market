@@ -362,67 +362,63 @@ class TestUnitAutoDetect:
 
 
 class TestGeminiPropertyExtractor:
-    """Unit tests for GeminiPropertyExtractor (HTTP calls mocked)."""
-
-    GEMINI_URL_PATTERN = re.compile(
-        r"https://generativelanguage\.googleapis\.com/.*generateContent.*"
-    )
+    """Unit tests for GeminiPropertyExtractor (SDK calls mocked)."""
 
     @staticmethod
-    def _gemini_response(total_properties, notes="ok"):
+    def _make_mock_response(total_properties, notes="ok"):
+        """Build a mock SDK response object."""
+        from unittest.mock import MagicMock
         body = json.dumps({"total_properties": total_properties, "notes": notes})
-        return httpx.Response(200, json={
-            "candidates": [{"content": {"parts": [{"text": body}]}}]
-        })
+        mock_resp = MagicMock()
+        mock_resp.text = body
+        return mock_resp
 
-    @respx.mock
     def test_returns_property_count(self, monkeypatch):
         """A valid Gemini response is parsed to a dict with total_properties."""
+        from unittest.mock import MagicMock
         from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
 
         monkeypatch.setattr("reit_dashboard.data.gemini_client.time.sleep", lambda _: None)
-        respx.post(self.GEMINI_URL_PATTERN).mock(
-            return_value=self._gemini_response(1500, "Found total row = 1500")
-        )
 
         extractor = GeminiPropertyExtractor(api_key="test-key")
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._make_mock_response(1500, "Found total row = 1500")
+        extractor._client = mock_client
+
         result = extractor.extract_property_count("Property Type\tCount\nOffice\t500\nTotal\t1500")
 
         assert result["total_properties"] == 1500
         assert "notes" in result
 
-    @respx.mock
     def test_null_count_when_not_found(self, monkeypatch):
         """Gemini returning null total_properties is propagated correctly."""
+        from unittest.mock import MagicMock
         from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
 
         monkeypatch.setattr("reit_dashboard.data.gemini_client.time.sleep", lambda _: None)
-        respx.post(self.GEMINI_URL_PATTERN).mock(
-            return_value=self._gemini_response(None, "Cannot determine")
-        )
 
         extractor = GeminiPropertyExtractor(api_key="test-key")
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._make_mock_response(None, "Cannot determine")
+        extractor._client = mock_client
+
         result = extractor.extract_property_count("some table text")
 
         assert result["total_properties"] is None
 
     def test_empty_tables_text_skips_api(self, monkeypatch):
         """Empty tables_text must not call the Gemini API."""
+        from unittest.mock import MagicMock
         from reit_dashboard.data.gemini_client import GeminiPropertyExtractor
 
-        called = []
         monkeypatch.setattr("reit_dashboard.data.gemini_client.time.sleep", lambda _: None)
 
         extractor = GeminiPropertyExtractor(api_key="test-key")
-        # Patch _client to track calls
-        original_post = httpx.Client.post
-
-        def track_post(self, *a, **kw):
-            called.append(1)
-            return original_post(self, *a, **kw)
+        mock_client = MagicMock()
+        extractor._client = mock_client
 
         result = extractor.extract_property_count("")
 
-        assert not called
+        mock_client.models.generate_content.assert_not_called()
         assert result["total_properties"] is None
 

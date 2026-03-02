@@ -23,7 +23,7 @@ from reit_dashboard.config import get_gemini_api_key
 
 load_dotenv()
 
-_MODEL = "gemini-2.0-flash"
+_MODEL = "gemini-2.5-flash-preview-04-17"
 
 
 def main() -> None:
