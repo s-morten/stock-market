@@ -1141,7 +1141,7 @@ def main() -> None:
     # Section 6 – Macroeconomic Context                                   #
     # ------------------------------------------------------------------ #
     with st.expander("📊 Section 6 – Macroeconomic Context", expanded=False):
-        macro_df = load_macro_facts(SessionFactory)
+        macro_df = load_macro_facts(session_factory)
 
         if macro_df.empty:
             st.info(
