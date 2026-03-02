@@ -186,7 +186,7 @@ class GeminiPropertyExtractor:
                 )
                 return response.text or "{}"
             except genai_errors.ClientError as exc:
-                if exc.status_code != 429 or attempt > _MAX_RETRIES:
+                if exc.code != 429 or attempt > _MAX_RETRIES:
                     raise
                 print(
                     f"[GEMINI] 429 quota exceeded on attempt {attempt}/{_MAX_RETRIES}. "
