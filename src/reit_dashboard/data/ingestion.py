@@ -76,6 +76,21 @@ def _five_years_ago() -> date:
     return today.replace(year=today.year - 5)
 
 
+def _day_after(d: date) -> date:
+    """
+    Return the day immediately following *d*.
+
+    Parameters:
+        d: Reference date.
+
+    Returns:
+        date: d + one day.
+    """
+    from datetime import timedelta
+
+    return d + timedelta(days=1)
+
+
 def ingest_company(
     cik: str,
     client: EdgarClient,
@@ -113,8 +128,18 @@ def ingest_company(
     company_repo.upsert(company)
 
     # --- 2. Financial facts (10-Q, last 5 years) ---
+    # Use the latest stored period_end as a lower bound so we only fetch
+    # data that is genuinely new.  Fall back to the default window when the
+    # table is empty for this company.
+    latest = fact_repo.get_latest_period_end(cik)
+    effective_since = _day_after(latest) if latest else since_date
+    logger.info(
+        "Ingesting financial facts for %s since %s (latest stored: %s)",
+        cik, effective_since, latest,
+    )
+
     all_concept_facts = client.fetch_all_poc_facts(
-        cik, since_date=since_date, forms=_INGEST_FORMS
+        cik, since_date=effective_since, forms=_INGEST_FORMS
     )
     facts_upserted = 0
 
@@ -199,7 +224,16 @@ def ingest_stock_prices(
         since_date = _five_years_ago()
 
     price_repo = StockPriceRepository(session)
-    entries = stock_client.fetch_weekly_prices(ticker, since_date=since_date)
+
+    # Only fetch prices that are newer than what's already in the database.
+    latest = price_repo.get_latest_date(ticker)
+    effective_since = _day_after(latest) if latest else since_date
+    logger.info(
+        "Ingesting stock prices for %s since %s (latest stored: %s)",
+        ticker, effective_since, latest,
+    )
+
+    entries = stock_client.fetch_weekly_prices(ticker, since_date=effective_since)
 
     for entry in entries:
         price = StockPrice(
@@ -322,6 +356,16 @@ def ingest_property_data(
         cik, forms=forms, since_date=since_date, max_filings=max_filings
     )
 
+    # Build the set of accession numbers already in the DB so we can skip
+    # them without any network round-trips.
+    known_accns = prop_repo.get_known_accns(cik)
+    if known_accns:
+        logger.info(
+            "Skipping %d already-processed filing(s) for %s",
+            sum(1 for f in filings if f["accn"] in known_accns),
+            cik,
+        )
+
     filings_processed = 0
     filings_parsed = 0
     rows_upserted = 0
@@ -331,6 +375,11 @@ def ingest_property_data(
         accn = filing["accn"]
         form = filing["form"]
         period_end = filing.get("reportDate") or filing.get("filingDate", "")
+
+        # Skip filings we have already fully ingested.
+        if accn in known_accns:
+            logger.debug("Skipping already-ingested filing %s / %s", cik, accn)
+            continue
 
         try:
             html = client.fetch_filing_html(
@@ -463,33 +512,59 @@ def ingest_macro_data(
     """
     Fetch all configured FRED series and persist them to the database.
 
+    For each series the function checks the latest observation already
+    stored and only requests data that is newer, making repeated runs
+    incremental rather than re-fetching the full history.
+
     Parameters:
         fred_client: Initialised :class:`~reit_dashboard.data.fred_client.FredClient`.
         session:     Active SQLAlchemy session.
-        since_date:  Only fetch observations on or after this date.
+        since_date:  Global lower-bound date.  Per-series stored dates take
+                     precedence when they are *later* than this value.
 
     Returns:
         dict: Summary with keys ``series_fetched``, ``observations_upserted``,
               ``errors``.
     """
-    from reit_dashboard.data.fred_client import FRED_SERIES  # noqa: F401
+    from reit_dashboard.data.fred_client import FRED_SERIES
 
     repo = MacroFactRepository(session)
     total_upserted = 0
     errors: list[str] = []
 
-    observations = fred_client.fetch_all(since_date=since_date)
-    for obs in observations:
-        fact = MacroFact(
-            series_id=obs.series_id,
-            series_name=obs.series_name,
-            date=obs.date,
-            value=obs.value,
-            unit=obs.unit,
-            frequency=obs.frequency,
+    for series_id in FRED_SERIES:
+        # Determine per-series fetch window.
+        latest_stored = repo.get_latest_date(series_id)
+        if latest_stored is not None:
+            effective_since = _day_after(latest_stored)
+        elif since_date is not None:
+            effective_since = since_date
+        else:
+            effective_since = None
+
+        logger.info(
+            "Ingesting FRED series %s since %s (latest stored: %s)",
+            series_id, effective_since, latest_stored,
         )
-        repo.upsert(fact)
-        total_upserted += 1
+
+        try:
+            observations = fred_client.fetch_series(series_id, since_date=effective_since)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to fetch FRED series %s: %s", series_id, exc)
+            errors.append(f"{series_id}: {exc}")
+            continue
+
+        for obs in observations:
+            fact = MacroFact(
+                series_id=obs.series_id,
+                series_name=obs.series_name,
+                date=obs.date,
+                value=obs.value,
+                unit=obs.unit,
+                frequency=obs.frequency,
+            )
+            repo.upsert(fact)
+            total_upserted += 1
 
     return {
         "series_fetched": len(FRED_SERIES),

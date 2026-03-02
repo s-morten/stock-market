@@ -207,7 +207,11 @@ class TestIngestMacroData:
 
     def _mock_fred_client(self, observations: list[MacroObservation]) -> MagicMock:
         client = MagicMock(spec=FredClient)
-        client.fetch_all.return_value = observations
+        # Group observations by series so fetch_series returns the right ones.
+        by_series: dict[str, list[MacroObservation]] = {}
+        for obs in observations:
+            by_series.setdefault(obs.series_id, []).append(obs)
+        client.fetch_series.side_effect = lambda series_id, **_kw: by_series.get(series_id, [])
         return client
 
     def test_ingest_persists_observations(self, db_session):

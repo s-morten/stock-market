@@ -93,7 +93,12 @@ def main() -> None:
     print(f"{'Company':<30} {'Facts':>8} {'Concepts':>10}  Status")
     print("-" * 62)
     for r in edgar_results:
-        status = f"ERROR: {r['error']}" if r["error"] else "OK"
+        if r["error"]:
+            status = f"ERROR: {r['error']}"
+        elif r["facts_upserted"] == 0:
+            status = "up to date"
+        else:
+            status = "OK"
         print(
             f"{r['name']:<30} {r['facts_upserted']:>8} "
             f"{r['concepts_fetched']:>10}  {status}"
@@ -109,7 +114,12 @@ def main() -> None:
     print(f"{'Company':<30} {'Ticker':>8} {'Prices':>8}  Status")
     print("-" * 62)
     for r in stock_results:
-        status = f"ERROR: {r['error']}" if r["error"] else "OK"
+        if r["error"]:
+            status = f"ERROR: {r['error']}"
+        elif r["prices_upserted"] == 0:
+            status = "up to date"
+        else:
+            status = "OK"
         print(
             f"{r['name']:<30} {str(r.get('ticker', '')):>8} "
             f"{r['prices_upserted']:>8}  {status}"

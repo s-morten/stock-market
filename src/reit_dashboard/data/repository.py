@@ -163,6 +163,23 @@ class FinancialFactRepository:
         stmt = stmt.order_by(FinancialFact.cik, FinancialFact.period_end)
         return list(self._session.scalars(stmt))
 
+    def get_latest_period_end(self, cik: str) -> date | None:
+        """
+        Return the most recent ``period_end`` stored for a given CIK.
+
+        Parameters:
+            cik: Company CIK.
+
+        Returns:
+            date | None: Latest period end date, or ``None`` if no facts exist.
+        """
+        from sqlalchemy import func
+
+        stmt = select(func.max(FinancialFact.period_end)).where(
+            FinancialFact.cik == cik
+        )
+        return self._session.scalars(stmt).first()
+
 
 class StockPriceRepository:
     """
@@ -264,6 +281,23 @@ class StockPriceRepository:
         if end_date is not None:
             stmt = stmt.where(StockPrice.date <= end_date)
         return list(self._session.scalars(stmt))
+
+    def get_latest_date(self, ticker: str) -> date | None:
+        """
+        Return the most recent date stored for a given ticker.
+
+        Parameters:
+            ticker: Exchange ticker symbol.
+
+        Returns:
+            date | None: Latest stored date, or ``None`` if no prices exist.
+        """
+        from sqlalchemy import func
+
+        stmt = select(func.max(StockPrice.date)).where(
+            StockPrice.ticker == ticker
+        )
+        return self._session.scalars(stmt).first()
 
 
 class PropertyFactRepository:
@@ -406,6 +440,27 @@ class PropertyFactRepository:
                 result[cik] = row
         return result
 
+    def get_known_accns(self, cik: str) -> set[str]:
+        """
+        Return the set of all accession numbers already stored for a CIK.
+
+        Used to skip filings that have already been fully processed so the
+        ingestion pipeline is idempotent.
+
+        Parameters:
+            cik: Company CIK.
+
+        Returns:
+            set[str]: All distinct accession numbers in the database for
+                this company.
+        """
+        stmt = (
+            select(PropertyFact.accn)
+            .where(PropertyFact.cik == cik)
+            .distinct()
+        )
+        return set(self._session.scalars(stmt))
+
 
 class MacroFactRepository:
     """
@@ -502,3 +557,20 @@ class MacroFactRepository:
         if end_date is not None:
             stmt = stmt.where(MacroFact.date <= end_date)
         return list(self._session.scalars(stmt))
+
+    def get_latest_date(self, series_id: str) -> date | None:
+        """
+        Return the most recent observation date stored for a FRED series.
+
+        Parameters:
+            series_id: FRED series identifier.
+
+        Returns:
+            date | None: Latest stored date, or ``None`` if no data exists.
+        """
+        from sqlalchemy import func
+
+        stmt = select(func.max(MacroFact.date)).where(
+            MacroFact.series_id == series_id
+        )
+        return self._session.scalars(stmt).first()
