@@ -84,6 +84,7 @@ class GeminiPropertyExtractor:
         self._api_key = api_key
         self._model = model
         self._timeout = timeout
+        print(api_key)
 
     def _post_with_retry(self, url: str, payload: dict) -> httpx.Response:
         """
