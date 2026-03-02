@@ -61,7 +61,20 @@ def is_gemini_enabled() -> bool:
     return flag not in {"0", "false", "no", "off"}
 
 
-def get_edgar_user_agent() -> str:
+def get_fred_api_key() -> str | None:
+    """
+    Return the FRED API key, or ``None`` if not configured.
+
+    A free API key can be obtained at https://fred.stlouisfed.org/docs/api/api_key.html
+    When ``None`` is returned macro ingestion is skipped silently.
+
+    Returns:
+        str | None: API key string, or ``None`` if the variable is unset.
+    """
+    return os.getenv("FRED_API_KEY") or None
+
+
+
     """
     Return the User-Agent string required by the SEC EDGAR API.
 

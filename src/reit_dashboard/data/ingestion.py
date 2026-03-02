@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.orm import Session
 
 from reit_dashboard.data.edgar_client import EdgarClient
-from reit_dashboard.data.models import Company, FinancialFact, StockPrice
+from reit_dashboard.data.models import Company, FinancialFact, MacroFact, StockPrice
 from reit_dashboard.data.property_parser import (
     extract_item2_tables_text,
     extract_property_data,
@@ -32,6 +32,7 @@ from reit_dashboard.data.property_parser import (
 from reit_dashboard.data.repository import (
     CompanyRepository,
     FinancialFactRepository,
+    MacroFactRepository,
     PropertyFactRepository,
     StockPriceRepository,
 )
@@ -447,3 +448,51 @@ def ingest_all_property_data(
             )
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Macroeconomic ingestion
+# ---------------------------------------------------------------------------
+
+
+def ingest_macro_data(
+    fred_client: "FredClient",  # type: ignore[name-defined]  # lazy import
+    session: Session,
+    since_date: date | None = None,
+) -> dict:
+    """
+    Fetch all configured FRED series and persist them to the database.
+
+    Parameters:
+        fred_client: Initialised :class:`~reit_dashboard.data.fred_client.FredClient`.
+        session:     Active SQLAlchemy session.
+        since_date:  Only fetch observations on or after this date.
+
+    Returns:
+        dict: Summary with keys ``series_fetched``, ``observations_upserted``,
+              ``errors``.
+    """
+    from reit_dashboard.data.fred_client import FRED_SERIES  # noqa: F401
+
+    repo = MacroFactRepository(session)
+    total_upserted = 0
+    errors: list[str] = []
+
+    observations = fred_client.fetch_all(since_date=since_date)
+    for obs in observations:
+        fact = MacroFact(
+            series_id=obs.series_id,
+            series_name=obs.series_name,
+            date=obs.date,
+            value=obs.value,
+            unit=obs.unit,
+            frequency=obs.frequency,
+        )
+        repo.upsert(fact)
+        total_upserted += 1
+
+    return {
+        "series_fetched": len(FRED_SERIES),
+        "observations_upserted": total_upserted,
+        "errors": errors,
+    }

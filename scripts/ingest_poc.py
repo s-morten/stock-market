@@ -22,12 +22,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
-from reit_dashboard.config import get_database_url, get_edgar_user_agent, is_gemini_enabled
+from reit_dashboard.config import get_database_url, get_edgar_user_agent, get_fred_api_key, is_gemini_enabled
 from reit_dashboard.data.edgar_client import EdgarClient
 from reit_dashboard.data.ingestion import (
     ingest_all_poc_reits,
     ingest_all_property_data,
     ingest_all_stock_prices,
+    ingest_macro_data,
 )
 from reit_dashboard.data.models import Base
 from reit_dashboard.data.stock_price_client import StockPriceClient
@@ -146,6 +147,29 @@ def main() -> None:
 
     all_results = edgar_results + stock_results + property_results
     errors = [r for r in all_results if r["error"]]
+
+    # ------------------------------------------------------------------ #
+    # 4. Macroeconomic data via FRED                                       #
+    # ------------------------------------------------------------------ #
+    fred_key = get_fred_api_key()
+    if fred_key:
+        print("\n=== Macroeconomic data ingestion (FRED) ===\n")
+        from reit_dashboard.data.fred_client import FredClient
+
+        fred_client = FredClient(api_key=fred_key)
+        with SessionFactory() as session:
+            macro_summary = ingest_macro_data(fred_client, session)
+            session.commit()
+        print(
+            f"  Series fetched : {macro_summary['series_fetched']}\n"
+            f"  Observations   : {macro_summary['observations_upserted']}\n"
+        )
+    else:
+        print(
+            "\n=== Macroeconomic data ingestion skipped ===\n"
+            "  Set FRED_API_KEY in .env to enable FRED ingestion.\n"
+        )
+
     if errors:
         print(f"\n{len(errors)} step(s) failed.")
         sys.exit(1)

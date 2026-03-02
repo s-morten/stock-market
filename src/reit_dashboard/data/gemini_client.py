@@ -24,7 +24,7 @@ from google.genai import errors as genai_errors
 logger = logging.getLogger(__name__)
 
 # Default model – free tier, fast, sufficient for structured extraction.
-DEFAULT_MODEL = "gemini-2.5-flash-preview-04-17"
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 # Seconds to wait between consecutive Gemini requests to respect 10 RPM.
 _GEMINI_REQUEST_DELAY = 7.0

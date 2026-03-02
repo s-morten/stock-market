@@ -6,6 +6,7 @@ Three models are defined:
 - FinancialFact: a single XBRL financial data point for a company/period.
 - StockPrice:    weekly OHLCV price bar for a publicly traded REIT.
 - PropertyFact:  a single property metric parsed from a filing's Item 2.
+- MacroFact:     a single macroeconomic data point from the FRED API.
 
 No Oracle-specific dialect features are used; the same models work with
 SQLite (development) and Oracle (production) by changing DATABASE_URL.
@@ -209,4 +210,44 @@ class PropertyFact(Base):
         return (
             f"<PropertyFact cik={self.cik!r} period_end={self.period_end!r}"
             f" property_type={self.property_type!r} {self.metric_name}={self.value!r}>"
+        )
+
+
+class MacroFact(Base):
+    """
+    A single macroeconomic data point fetched from the FRED API.
+
+    Each row represents one value for a specific FRED series on a specific
+    date (e.g. FEDFUNDS = 5.33 on 2024-01-01).
+
+    Attributes:
+        id:          Surrogate primary key.
+        series_id:   FRED series identifier (e.g. "FEDFUNDS").
+        series_name: Human-readable name (e.g. "Federal Funds Rate").
+        date:        Observation date.
+        value:       Observed numeric value.
+        unit:        Unit of measure (e.g. "Percent", "Thousands of Persons").
+        frequency:   Reporting frequency (e.g. "Monthly", "Weekly").
+    """
+
+    __tablename__ = "macro_facts"
+    __table_args__ = (
+        UniqueConstraint(
+            "series_id", "date",
+            name="uq_macro_fact_series_date",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    series_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    series_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    value: Mapped[Decimal] = mapped_column(Numeric(precision=20, scale=6), nullable=False)
+    unit: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    frequency: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+
+    def __repr__(self) -> str:
+        return (
+            f"<MacroFact series={self.series_id!r} date={self.date!r}"
+            f" value={self.value!r}>"
         )

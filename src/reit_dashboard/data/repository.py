@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from reit_dashboard.data.models import Company, FinancialFact, PropertyFact, StockPrice
+from reit_dashboard.data.models import Company, FinancialFact, MacroFact, PropertyFact, StockPrice
 
 
 class CompanyRepository:
@@ -405,3 +405,100 @@ class PropertyFactRepository:
             if row is not None:
                 result[cik] = row
         return result
+
+
+class MacroFactRepository:
+    """
+    Repository for MacroFact persistence and queries.
+
+    Parameters:
+        session: Active SQLAlchemy session.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert(self, fact: MacroFact) -> None:
+        """
+        Insert or update a single MacroFact.
+
+        Uses SQLite's ``ON CONFLICT DO UPDATE`` to avoid duplicates on
+        (series_id, date).
+
+        Parameters:
+            fact: MacroFact instance to persist.
+        """
+        stmt = (
+            sqlite_insert(MacroFact)
+            .values(
+                series_id=fact.series_id,
+                series_name=fact.series_name,
+                date=fact.date,
+                value=fact.value,
+                unit=fact.unit,
+                frequency=fact.frequency,
+            )
+            .on_conflict_do_update(
+                index_elements=["series_id", "date"],
+                set_={
+                    "series_name": fact.series_name,
+                    "value": fact.value,
+                    "unit": fact.unit,
+                    "frequency": fact.frequency,
+                },
+            )
+        )
+        self._session.execute(stmt)
+
+    def get_series(
+        self,
+        series_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[MacroFact]:
+        """
+        Fetch all observations for one FRED series, optionally filtered by date.
+
+        Parameters:
+            series_id:  FRED series identifier.
+            start_date: Earliest date (inclusive).
+            end_date:   Latest date (inclusive).
+
+        Returns:
+            list[MacroFact]: Sorted by date ascending.
+        """
+        stmt = (
+            select(MacroFact)
+            .where(MacroFact.series_id == series_id)
+            .order_by(MacroFact.date)
+        )
+        if start_date is not None:
+            stmt = stmt.where(MacroFact.date >= start_date)
+        if end_date is not None:
+            stmt = stmt.where(MacroFact.date <= end_date)
+        return list(self._session.scalars(stmt))
+
+    def get_all_series(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[MacroFact]:
+        """
+        Fetch all stored macro observations, optionally filtered by date.
+
+        Parameters:
+            start_date: Earliest date (inclusive).
+            end_date:   Latest date (inclusive).
+
+        Returns:
+            list[MacroFact]: Sorted by series_id and date.
+        """
+        stmt = (
+            select(MacroFact)
+            .order_by(MacroFact.series_id, MacroFact.date)
+        )
+        if start_date is not None:
+            stmt = stmt.where(MacroFact.date >= start_date)
+        if end_date is not None:
+            stmt = stmt.where(MacroFact.date <= end_date)
+        return list(self._session.scalars(stmt))

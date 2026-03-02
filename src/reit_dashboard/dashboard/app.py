@@ -22,6 +22,7 @@ from reit_dashboard.data.models import Base
 from reit_dashboard.data.repository import (
     CompanyRepository,
     FinancialFactRepository,
+    MacroFactRepository,
     PropertyFactRepository,
     StockPriceRepository,
 )
@@ -252,6 +253,41 @@ def load_property_facts(
 
     df = pd.DataFrame(rows)
     df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=3600)
+def load_macro_facts(_session_factory) -> pd.DataFrame:
+    """
+    Load all macroeconomic observations from the database.
+
+    Parameters:
+        _session_factory: SQLAlchemy sessionmaker (underscore prefix so
+            Streamlit does not hash it).
+
+    Returns:
+        pd.DataFrame: Columns series_id, series_name, date, value, unit,
+            frequency.  Returns empty DataFrame when no data is available.
+    """
+    rows: list[dict] = []
+    with _session_factory() as session:
+        repo = MacroFactRepository(session)
+        facts = repo.get_all_series()
+        for f in facts:
+            rows.append(
+                {
+                    "series_id": f.series_id,
+                    "series_name": f.series_name,
+                    "date": f.date,
+                    "value": float(f.value),
+                    "unit": f.unit,
+                    "frequency": f.frequency,
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     return df
 
 
@@ -1100,6 +1136,125 @@ def main() -> None:
             latest_pe["TTM EPS"] = latest_pe["TTM EPS"].map("${:,.4f}".format)
             latest_pe["P/E Ratio"] = latest_pe["P/E Ratio"].map("{:.1f}x".format)
             st.dataframe(latest_pe, use_container_width=True, hide_index=True)
+
+    # ------------------------------------------------------------------ #
+    # Section 6 – Macroeconomic Context                                   #
+    # ------------------------------------------------------------------ #
+    with st.expander("📊 Section 6 – Macroeconomic Context", expanded=False):
+        macro_df = load_macro_facts(SessionFactory)
+
+        if macro_df.empty:
+            st.info(
+                "No macroeconomic data available.  "
+                "Run `uv run python scripts/ingest_poc.py` with `FRED_API_KEY` set."
+            )
+        else:
+            # Apply date range filter
+            macro_df = macro_df[
+                (macro_df["date"] >= pd.Timestamp(start_date))
+                & (macro_df["date"] <= pd.Timestamp(end_date))
+            ]
+
+            # --- Tab 1: Interest rates overlay (policy rate + bond yields) ---
+            # --- Tab 2: Labour market (unemployment) -----------------------
+            # --- Tab 3: Inflation (core CPI) --------------------------------
+            tab_rates, tab_labour, tab_inflation = st.tabs(
+                ["Interest Rates", "Labour Market", "Inflation"]
+            )
+
+            with tab_rates:
+                rate_ids = {"FEDFUNDS", "GS2", "GS10"}
+                rate_df = macro_df[macro_df["series_id"].isin(rate_ids)].copy()
+                if rate_df.empty:
+                    st.info("No interest-rate data in the selected date range.")
+                else:
+                    chart = (
+                        alt.Chart(rate_df)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("date:T", title="Date",
+                                    axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                            y=alt.Y("value:Q", title="Rate (%)",
+                                    scale=alt.Scale(zero=False)),
+                            color=alt.Color("series_name:N", title="Series"),
+                            tooltip=[
+                                alt.Tooltip("series_name:N", title="Series"),
+                                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                                alt.Tooltip("value:Q", title="Rate (%)", format=".2f"),
+                            ],
+                        )
+                        .properties(
+                            title="Central Bank Policy Rate & Government Bond Yields",
+                            height=380,
+                        )
+                        .interactive()
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+                    latest = (
+                        rate_df.sort_values("date")
+                        .groupby("series_name")
+                        .last()
+                        .reset_index()[["series_name", "date", "value"]]
+                        .rename(columns={"series_name": "Series", "date": "Latest Date",
+                                         "value": "Rate (%)"})
+                    )
+                    latest["Rate (%)"] = latest["Rate (%)"].map("{:.2f}%".format)
+                    st.dataframe(latest, use_container_width=True, hide_index=True)
+
+            with tab_labour:
+                labour_df = macro_df[macro_df["series_id"] == "UNRATE"].copy()
+                if labour_df.empty:
+                    st.info("No unemployment data in the selected date range.")
+                else:
+                    chart = (
+                        alt.Chart(labour_df)
+                        .mark_line(color="#e45756")
+                        .encode(
+                            x=alt.X("date:T", title="Date",
+                                    axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                            y=alt.Y("value:Q", title="Unemployment Rate (%)",
+                                    scale=alt.Scale(zero=True)),
+                            tooltip=[
+                                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                                alt.Tooltip("value:Q", title="Unemployment (%)",
+                                            format=".1f"),
+                            ],
+                        )
+                        .properties(title="US Unemployment Rate", height=360)
+                        .interactive()
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+
+            with tab_inflation:
+                cpi_df = macro_df[macro_df["series_id"] == "CPILFESL"].copy()
+                if cpi_df.empty:
+                    st.info("No core CPI data in the selected date range.")
+                else:
+                    # Compute YoY % change from the raw index.
+                    cpi_df = cpi_df.sort_values("date").copy()
+                    cpi_df["yoy_pct"] = cpi_df["value"].pct_change(12) * 100
+                    yoy_df = cpi_df.dropna(subset=["yoy_pct"])
+                    chart = (
+                        alt.Chart(yoy_df)
+                        .mark_line(color="#72b7b2")
+                        .encode(
+                            x=alt.X("date:T", title="Date",
+                                    axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+                            y=alt.Y("yoy_pct:Q", title="Core CPI YoY (%)",
+                                    scale=alt.Scale(zero=False)),
+                            tooltip=[
+                                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                                alt.Tooltip("yoy_pct:Q", title="Core CPI YoY (%)",
+                                            format=".2f"),
+                            ],
+                        )
+                        .properties(
+                            title="Core Inflation (CPI Less Food & Energy, YoY %)",
+                            height=360,
+                        )
+                        .interactive()
+                    )
+                    st.altair_chart(chart, use_container_width=True)
 
 
 main()
